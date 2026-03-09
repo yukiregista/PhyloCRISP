@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "PhyloCRISP"
+version = "0.0.1"
+authors = [
+  { name="Yuki Takazawa", email="yuki-takazawa@g.ecc.u-tokyo.ac.jp" },
+]
+description = "Implementation of consensus methods."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
+    "Operating System :: OS Independent",
+]
+dependencies = ["numpy", "pandas", "scipy", "dendropy", "bitstring", "biopython", "distance", "lxml", "six", "PyQt6", "tqdm", "Flask"]
+
+[project.optional-dependencies]
+viz = [
+    "ete4"
+]
+dev = [
+    "pytest", "memory_profiler", "pyinstaller", "pyinstaller-hooks-contrib"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yukiregista/PhyloCRISP"
+
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["Consensus"]
+license-files = ["LICENSE", "third_party_licenses/**"]
+
+
+[project.scripts]
+phylocrisp-cli = "Consensus.main:main"

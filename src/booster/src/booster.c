@@ -1,0 +1,1779 @@
+/*
+
+BOOSTER: BOOtstrap Support by TransfER: 
+BOOSTER is an alternative method to compute bootstrap branch supports 
+in large trees. It uses transfer distance between bipartitions, instead
+of perfect match.
+
+Copyright (C) 2017 Frederic Lemoine, Jean-Baka Domelevo Entfellner, Olivier Gascuel
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+*/
+
+#include "io.h"
+#include "tree.h"
+#include "bitset_index.h"
+#include "M1M2_hashmap.h"
+#include "rapid_transfer.h"
+#include "transfer_distance.h"
+
+#include <string.h> /* for strcpy, strdup, etc */
+#include <getopt.h>
+#ifdef _OPENMP
+#include <omp.h> /* OpenMP */
+#else
+/* Single-threaded fallback for toolchains without OpenMP (e.g., Apple clang by default). */
+static inline int omp_get_max_threads(void) { return 1; }
+static inline int omp_get_num_threads(void) { return 1; }
+static inline void omp_set_num_threads(int n) { (void)n; }
+#endif
+#include <math.h>
+
+#include "version.h"
+// #include <libc.h>
+
+// __attribute__((destructor))
+// static void destructor() {
+//     system("leaks -q booster");
+// }
+
+
+/**
+   A large part of the code was initally implemented by Jean-Baka Domelevo-Entfellner 
+   (tree structures, tbe algorithm)
+*/
+
+
+
+typedef struct {
+    split bipartition;   // Pointer to bipartition (array of unsigned ints)
+    int topo_depth; // Topological Depth of the bipartition
+    split *matches;      // Pointer to a list of bipartitions (array of unsigned int pointers)
+    int* td; // Array of transfer distances
+    bool is_external; //If this bipartition corresopnds to the external edge
+} BipartitionMatches;
+
+typedef struct {
+    BipartitionMatches **entries;  // Array of bipartition matches
+    int num_entries;              // Number of bipartitions
+    size_t bipartition_size; // Size of the bipartition
+    int num_matches; // Number of matches (k)
+    int n_taxa; //Number of taxa
+    int uint_bits; //Bits for one uint;
+} BipartitionDict;
+
+
+typedef struct {
+    BipartitionDict* bdict;
+    int num_trees;
+} BipartitionDictArray;
+
+
+/* Efficient version (hash version)*/
+typedef struct __BipartitionMatchesHash {
+  unsigned int h1;
+  unsigned int h2;
+  int topo_depth;
+  int* matched_ids; // bipartition_id of matched hash.
+  int* td;
+  int input_count; //Number of appearances in the input tree.
+} BipartitionMatchesHash;
+
+typedef struct __BipartitionDictHash {
+    BipartitionMatchesHash **entries;  // Array of bipartition matches
+    int num_entries;              // Number of bipartitions
+    int num_matches; // Number of matches (k)
+    int n_taxa; //Number of taxa
+} BipartitionDictHash;
+
+
+typedef struct {
+  split bipartition;
+  bool is_external;
+  double support;
+} BipartitionSupport;
+typedef struct {
+  int num_entries;
+  size_t bipartition_size;
+  int n_taxa;
+  int uint_bits;
+  BipartitionSupport** bipartition_supports;
+} BipartitionSupportArray;
+
+
+
+typedef struct __BipartitionSupportHash {
+  unsigned int h1; // hash#1
+  unsigned int h2; // hash#2
+  bool is_external; // 1 if it is an external edge.
+  double support; // support value.
+  int node_id; // node id ; i.e. the index of ref_tree->a_nodes that gives this node (bipartition)
+  int topo_depth; // Topological depth of this ref tree edge.
+} BipartitionSupportHash;
+
+typedef struct __BipartitionSupportArrayHash {
+  int num_entries; // number of edges in the ref tree.
+  int n_taxa; // number of taxa in the ref tree;
+  BipartitionSupportHash** bipartition_supports; // Array of bipartition supports.
+  int num_alt_trees; // Number of input trees used for support computation.
+} BipartitionSupportArrayHash;
+
+
+
+typedef struct __TbeSupportMatchResult{
+  BipartitionDictHash* bdict;
+  BipartitionSupportArrayHash *bsupp_arr;
+} TbeSupportMatchResult;
+
+
+// #define COMPARE_TBE_METHODS
+// #define ASSUME_BALANCED      //Use code that assumes balanced bootstrap trees
+
+void tbe(bool rapid, Tree *ref_tree, Tree *ref_raw_tree, char **alt_tree_strings,char** taxname_lookup_table, FILE *stat_file, int num_trees, int quiet, double dist_cutoff,int count_per_branch, int k);
+void fbp(Tree *ref_tree, char **alt_tree_strings,char** taxname_lookup_table, int num_trees, int quiet);
+int* species_to_move(Edge* re, Edge* be, int dist, int nb_taxa);
+void compute_transfer_indices(Tree *ref_tree, const int n, const int m,
+                              Tree *alt_tree, int *transfer_indices,
+                              const int max_branches_boot,
+                              double *moved_species_counts,
+                              int **moved_species_counts_per_branch,
+                              int count_per_branch, const double dist_cutoff);
+void assert_equal_TI(int *ti_new, int *ti_old, Tree *ref_tree);
+void tbe_match_doer(Tree *ref_tree, Tree *ref_raw_tree,
+         Tree *alt_tree, char** taxname_lookup_table, FILE *stat_file,
+         int quiet, double dist_cutoff, int count_per_branch, int k,
+         BipartitionDict* bdict);
+
+void tbe_support_doer(Tree *ref_tree, Tree *ref_raw_tree,
+         Tree *alt_tree, char** taxname_lookup_table, FILE *stat_file,
+         int quiet, double dist_cutoff, int count_per_branch, int spl,
+         BipartitionSupport** bsupp);
+
+void tbe_support_doer_efficient(Tree *ref_tree,
+         Tree *alt_tree,
+         int quiet,
+         BipartitionSupportArrayHash* bsupp_arr);
+
+
+int tbe_match_doer_efficient(Tree *ref_tree, 
+         Tree *alt_tree,
+         int quiet,
+         int k,
+         BipartitionDictHash* bdict,
+         int finished_internal_bipartition_id);
+
+
+
+
+void after_tbe_match(BipartitionDictArray* bdict);
+
+void usage(FILE * out,char *name){
+  fprintf(out,"Usage: ");
+  fprintf(out,"%s -i <ref tree file (newick)> -b <bootstrap tree file (newick)> [-@ <cpus> -d <dist_cutoff> -r <raw distance output tree file> -S <stat file> -o <output tree> -v]\n",name);
+  fprintf(out,"Options:\n");
+  fprintf(out,"      -i, --input            : Input tree file\n");
+  fprintf(out,"      -b, --boot             : Bootstrap tree file (1 file containing all bootstrap trees)\n");
+  fprintf(out,"      -o, --out              : Output file (optional) with normalized support values, default : stdout\n");
+  fprintf(out,"      -r, --out-raw          : Output file (optional) with raw support values in the form of id|avgdist|depth, default : none\n");
+  fprintf(out,"      -@, --num-threads      : Number of threads (default 1)\n");
+  fprintf(out,"      -S, --stat-file        : Prints output statistics for each branch in the given output file (optional)\n");
+  fprintf(out,"      -c, --count-per-branch : Prints individual taxa moves for each branches in the log file (only with -S & -a tbe)\n");
+  fprintf(out,"      -d, --dist-cutoff      : Distance cutoff to consider a branch for taxa transfer index computation (-a tbe only, default 0.3)\n");
+  fprintf(out,"      -a, --algo             : rtbe or tbe or fbp (default rtbe)\n");
+  fprintf(out,"      -k, --number-of-best-match: Number of matching computed (default: 1)");
+  fprintf(out,"      -q, --quiet            : Does not print progress messages during analysis\n");
+  fprintf(out,"      -v, --version          : Prints version (optional)\n");
+  fprintf(out,"      -h, --help             : Prints this help\n");
+  fprintf(out,"\n");
+  fprintf(out,"If you use BOOSTER, please cite:\n");
+  fprintf(out,"Renewing Felsenstein's Phylogenetic Bootstrap in the Era of Big Data\n");
+  fprintf(out,"F. Lemoine, J.-B. Domelevo-Entfellner, E. Wilkinson, D. Correia, M. Davila Felipe, T. De Oliveira, O. Gascuel.\n");
+  fprintf(out,"Nature 556, 452-456 (2018)\n");
+}
+
+void printOptions(FILE * out,char* input_tree,char * boot_trees, char * output_tree, char * output_raw_tree, char *output_stat, char *algo, int nb_threads, int quiet, double dist_cutoff, int count_per_branch, int k){
+  fprintf(out,"**************************\n");
+  fprintf(out,"*         Options        *\n");
+  fprintf(out,"**************************\n");
+  short_version(out);
+  fprintf(out,"Input Tree      : %s\n", input_tree);
+  fprintf(out,"Bootstrap Trees : %s\n", boot_trees);
+  if(output_tree==NULL)
+    fprintf(out,"Output tree     : stdout\n");
+  else
+    fprintf(out,"Output tree     : %s\n",output_tree);
+  if(output_raw_tree!=NULL)
+    fprintf(out,"Output raw tree : %s\n",output_raw_tree);
+  if(output_stat==NULL)
+    fprintf(out,"Stat file       : None\n");
+  else
+    fprintf(out,"Stat file       : %s\n",output_stat);
+  fprintf(out,"Algo            : %s\n", algo);
+  if(count_per_branch){
+    fprintf(out,"Count tax move/branch: true\n");
+  }else{
+    fprintf(out,"Count tax move/branch: false\n");
+  }
+  fprintf(out,"Threads         : %d\n", nb_threads);
+  fprintf(out,"Dist cutoff     : %f\n", dist_cutoff);
+  if(quiet)
+    fprintf(out,"Quiet           : true\n");
+  else
+    fprintf(out,"Quiet           : false\n");
+  fprintf(out, "Number of best match: %d\n", k);
+  fprintf(out,"**************************\n");
+}
+
+void reset_matrices(int nb_taxa, int nb_edges_ref, int nb_edges_boot, short unsigned*** c_matrix, short unsigned*** i_matrix, short unsigned*** hamming, short unsigned** min_dist, short unsigned** min_dist_edges){
+  int i;
+  (*min_dist) = (short unsigned*) malloc(nb_edges_ref*sizeof(short unsigned)); /* array of min Hamming distances */
+  (*min_dist_edges) = (short unsigned*) malloc(nb_edges_ref*sizeof(short unsigned)); /* array of edge ids corresponding to min Hamming distances */
+  (*c_matrix) = (short unsigned**) malloc(nb_edges_ref*sizeof(short unsigned*)); /* matrix of cardinals of complements */
+  (*i_matrix) = (short unsigned**) malloc(nb_edges_ref*sizeof(short unsigned*)); /* matrix of cardinals of intersections */
+  (*hamming) = (short unsigned**) malloc(nb_edges_ref*sizeof(short unsigned*)); /* matrix of Hamming distances */
+  for (i=0; i<nb_edges_ref; i++){
+    (*c_matrix)[i] = (short unsigned*) malloc(nb_edges_boot*sizeof(short unsigned));
+    (*i_matrix)[i] = (short unsigned*) malloc(nb_edges_boot*sizeof(short unsigned));
+    (*hamming)[i] = (short unsigned*) malloc(nb_edges_boot*sizeof(short unsigned));
+    (*min_dist)[i] = nb_taxa; /* initialization to the nb of taxa */
+  }
+}
+
+void free_matrices(int nb_edges_ref, short unsigned*** c_matrix, short unsigned*** i_matrix, short unsigned*** hamming, short unsigned** min_dist, short unsigned** min_dist_edges){
+  int i;
+  for (i=0; i<nb_edges_ref; i++) {
+    free((*c_matrix)[i]);
+    free((*i_matrix)[i]);
+    free((*hamming)[i]);
+  }
+  free((*c_matrix));
+  free((*i_matrix));
+  free((*hamming));
+  free((*min_dist));
+  free((*min_dist_edges));
+}
+
+int main (int argc, char* argv[]) {
+  /* this program takes as input three arguments.
+     Arg1 is the filename of the reference tree.
+     Arg2 is the prefix (including path if necessary) of the trees to be compared to the reference (bootstrapped trees)
+     OR Arg2 is a single file containing all the bootstrap trees, one per line.
+     Arg3 is the name of the output file (output tree with bootstrap values). */
+
+  int i, retcode;
+  /* int one_side; /\* to store a number of taxa seen on one side of a branch in the ref tree *\/ */
+
+  FILE *output_file = NULL;
+  FILE *intree_file = NULL;
+  FILE *boottree_file = NULL;
+  FILE *stat_file = NULL;
+  FILE *output_raw_file = NULL; /* Output tree file with edge bootstrap values noted as "id|avgdist|topo_depth" */
+  
+  char *input_tree = NULL;
+  char *boot_trees = NULL;
+  char *out_tree = NULL;
+  char *out_raw_tree = NULL;
+  char *stat_out = NULL;
+
+  Tree *ref_tree;
+  Tree *ref_raw_tree = NULL; /* For raw support at edges : id|avgdist|depth */
+  char **alt_tree_strings;
+
+  char *algo = "rtbe";
+  
+  int quiet = 0;
+
+  int k=1;
+
+  
+  int num_threads = 1;
+
+  double dist_cutoff = 0.3;
+
+  /* If true, compute and print in the log file the (normalized) number of moves of each taxa for all branches */
+  int count_per_branch = 0;
+
+  static struct option long_options[] = {
+    {"input", required_argument, 0, 'i'},
+    {"boot" , required_argument, 0, 'b'},
+    {"out"  , required_argument, 0, 'o'},
+    {"out-raw"  , required_argument, 0, 'r'},
+    {"count-per-branch", no_argument, 0, 'c'},
+    {"stat-file" , required_argument, 0, 'S'},
+    {"algo" , required_argument, 0, 'a'},
+    {"dist-cutoff" , required_argument, 0, 'd'},
+    {"num-threads", required_argument, 0,'@'},
+    {"help" , no_argument      , 0, 'h'},
+    {"version", no_argument      , 0, 'v'},
+    {"quiet", no_argument      , 0, 'q'},
+    {"number-of-best-match", required_argument, 0,  'k'},
+    {0, 0, 0, 0}
+  };
+
+  opterr = 0;
+  int option_index = 0;
+  int c = 0;
+  while ((c = getopt_long(argc, argv, "i:a:b:d:o:cs:@:S:n:r:hvqk:", long_options, &option_index)) != -1){
+    switch (c){
+    case 'i': input_tree = optarg; break;
+    case 'b': boot_trees = optarg; break;
+    case 'o': out_tree = optarg; break;
+    case '@': num_threads=strtol(optarg,NULL,10); break; 
+    case 'a': algo = optarg; break;
+    case 'c': count_per_branch=1; break;
+    case 'd': sscanf(optarg,"%lf",&dist_cutoff); break;
+    case 'S': stat_out = optarg; break;
+    case 'r': out_raw_tree = optarg; break;
+    case 'q': quiet = 1; break;
+    case 'h': usage(stdout,argv[0]); return EXIT_SUCCESS; break; 
+    case 'v': version(stdout,argv[0]); return EXIT_SUCCESS; break;
+    case 'k': k=strtol(optarg, NULL, 10); break;
+    case ':': fprintf(stderr, "Option -%c requires an argument\n", optopt); return EXIT_FAILURE; break;
+    case '?': fprintf(stderr, "Option -%c is undefined\n", optopt); return EXIT_FAILURE; break;
+    }
+  }
+
+  if(strcmp(algo,"tbe") && strcmp(algo,"fbp") && strcmp(algo, "rtbe")){
+    fprintf(stderr,"Algo option must be one of \"rtbe\" or \"tbe\" or \"fbp\"\n");
+    Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+  }
+  
+  if (argc < optind || input_tree == NULL || boot_trees == NULL){
+    fprintf(stderr,"An option is missing\n");
+    usage(stderr,argv[0]);
+    Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+  }
+
+  if(num_threads>0){
+    if(num_threads > omp_get_max_threads())
+      num_threads = omp_get_max_threads();
+  }else{
+    num_threads = 1;
+  }
+  omp_set_num_threads(num_threads);
+
+  if(stat_out !=NULL){
+    stat_file = fopen(stat_out,"w");
+    if(stat_file == NULL){
+      fprintf(stderr,"File %s not found or not writable. Aborting.\n", stat_out);
+      Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+    }
+  } else stat_file = NULL;
+
+  /* writing the output tree to the file given on the commandline */
+  if(out_tree == NULL){
+    output_file = stdout;
+  }else{
+    output_file = fopen(out_tree,"w");
+    if(output_file == NULL){
+      fprintf(stderr,"File %s not found or not writable. Aborting.\n", out_tree);
+      Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+    }
+  }
+
+  /* writing the output tree to the file given on the commandline */
+  if(out_raw_tree != NULL){
+    output_raw_file = fopen(out_raw_tree,"w");
+    if(output_raw_file == NULL){
+      fprintf(stderr,"File %s not found or not writable. Aborting.\n", out_raw_tree);
+      Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+    }
+  }
+
+
+  
+  if(!quiet) printOptions(stderr, input_tree, boot_trees, out_tree, out_raw_tree, stat_out, algo, num_threads, quiet, dist_cutoff, count_per_branch, k);
+
+  intree_file = fopen(input_tree,"r");
+  if (intree_file == NULL) {
+    fprintf(stderr,"File %s not found or impossible to access media. Aborting.\n", input_tree);
+    Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+  }
+
+  /* we copy the tree into a large string */
+  unsigned int treefilesize = 3 * tell_size_of_one_tree(input_tree);
+  if (treefilesize > MAX_TREELENGTH) {
+    fprintf(stderr,"Tree filesize for %s bigger than %d bytes: are you sure it's a valid NH tree? Aborting.\n", input_tree, MAX_TREELENGTH/3);
+    Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+  }
+
+  char *big_string = (char*) calloc(treefilesize+1, sizeof(char)); 
+  retcode = copy_nh_stream_into_str(intree_file, big_string);
+  if (retcode != 1) { 
+    fprintf(stderr,"Unexpected EOF while parsing the reference tree! Aborting.\n"); 
+    Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+  }
+  fclose(intree_file);
+
+  /* and then feed this string to the parser */
+  bool rapid = !strcmp(algo, "rtbe");
+
+  bool skip_hashtables = rapid;
+  #ifdef COMPARE_TBE_METHODS
+  skip_hashtables = false;
+  #endif
+
+
+  /* Create hashtable
+  */
+
+  fprintf(stderr, "create hashtable\n");
+  M1M2Hashtable* hashtable = new_M1M2hashtable();
+
+  char** taxname_lookup_table = NULL;
+  ref_tree  = complete_parse_nh(big_string, &taxname_lookup_table, skip_hashtables, k, hashtable, 0); /* sets taxname_lookup_table en passant */
+  if(out_raw_tree !=NULL){
+    ref_raw_tree  = complete_parse_nh(big_string, &taxname_lookup_table, skip_hashtables, k, hashtable, 0); /* sets taxname_lookup_table en passant */
+  }
+
+  fprintf(stderr, "number of edges: %d\n", ref_tree->nb_edges);
+  fprintf(stderr, "number of nodes: %d\n", ref_tree->nb_nodes);
+
+
+  print_hashtable(ref_tree->hashtable);
+
+  /***********************************************************************/
+  /* Establishing the list of bootstrapped trees we are going to analyze */
+  /***********************************************************************/
+  int init_boot_trees = 10;
+  int i_tree;
+  int num_trees = 0; /* this is the number of trees really analyzed */
+
+  alt_tree_strings = malloc(init_boot_trees * sizeof(char*));
+  boottree_file = fopen(boot_trees,"r");
+  if (boottree_file == NULL) {
+    fprintf(stderr,"File %s not found or iƒmpossible to access media. Aborting.\n", boot_trees);
+    Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+  }
+
+  if (tell_size_of_one_tree(boot_trees) > treefilesize /* this value is still reachable */) {
+    fprintf(stderr,"error: size of one alternate tree bigger than three times the size of the ref tree! Aborting.\n");
+    Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+  }
+
+  /* we copy the tree into a large string */
+  while(copy_nh_stream_into_str(boottree_file, big_string)) /* reads from the current point in the stream, retcode 1 iff no error */
+    {
+      if(num_trees >= init_boot_trees){
+        alt_tree_strings = realloc(alt_tree_strings,init_boot_trees*2*sizeof(char*));
+        init_boot_trees *= 2;
+      }
+      alt_tree_strings[num_trees] = strdup(big_string);
+      num_trees++;
+    }
+  fclose(boottree_file);
+
+  if(!quiet)  fprintf(stderr,"Num trees: %d\n",num_trees);
+
+  treelist = malloc((num_trees + 1) * sizeof(Tree*));
+
+  if(!strcmp(algo,"tbe") || rapid){
+    tbe(rapid, ref_tree, ref_raw_tree, alt_tree_strings, taxname_lookup_table, stat_file, num_trees, quiet, dist_cutoff, count_per_branch, k);
+  }else{
+    fbp(ref_tree, alt_tree_strings, taxname_lookup_table, num_trees, quiet);
+  }
+  write_nh_tree(ref_tree, output_file, true);
+  if(output_raw_file!=NULL && ref_raw_tree!=NULL){
+    write_nh_tree(ref_raw_tree, output_raw_file, true);
+  }
+
+  fclose(output_file);
+  if(stat_file != NULL) fclose(stat_file);
+  // FREEING STUFF
+  free(big_string);
+
+  /* free the stuff for the calculation of the mast-like distances */
+  for(i_tree=0; i_tree < num_trees;i_tree++){
+    free(alt_tree_strings[i_tree]);
+  }
+  free(alt_tree_strings);
+
+  /* we also have to free the taxname lookup table */
+  for(i=0; i < ref_tree->nb_taxa; i++) free(taxname_lookup_table[i]); /* freeing (char*)'s */
+  free(taxname_lookup_table); /* which is a (char**) */
+  free_tree(ref_tree);
+  free_M1M2hashtable(hashtable);
+  free(treelist);
+  return 0;
+}
+
+
+BipartitionDictArray* tbe_match (int argc, char* argv[], char** nh_tree1, char* nh_tree2, int num_trees) {
+  /* this program takes as input three arguments.
+     Arg1 is the filename of the reference tree.
+     Arg2 is the prefix (including path if necessary) of the trees to be compared to the reference (bootstrapped trees)
+     OR Arg2 is a single file containing all the bootstrap trees, one per line.
+     Arg3 is the name of the output file (output tree with bootstrap values). */
+
+  int i;
+
+
+  Tree *ref_tree;
+
+  int quiet = 0;
+
+  int k=1;
+  
+  int num_threads = 1;
+
+  double dist_cutoff = 0.3;
+
+  opterr = 0;
+  int option_index = 0;
+  int c = 0;
+
+  if (!strcmp(argv[1], "-k")) k = strtol(argv[2], NULL, 10);
+
+
+
+  if(num_threads>0){
+    if(num_threads > omp_get_max_threads())
+      num_threads = omp_get_max_threads();
+  }else{
+    num_threads = 1;
+  }
+  omp_set_num_threads(num_threads);
+
+
+  /* and then feed this string to the parser */
+  bool rapid = true;
+
+  bool skip_hashtables = rapid;
+
+  char** taxname_lookup_table = NULL;
+
+  BipartitionDictArray* BdictArray = malloc(sizeof(BipartitionDictArray));
+  BdictArray->num_trees = num_trees;
+  BdictArray->bdict = malloc(sizeof(BipartitionDict) * num_trees);
+
+  M1M2Hashtable* hashtable = new_M1M2hashtable();
+
+  Tree * alt_tree;
+  alt_tree = complete_parse_nh(nh_tree2, &taxname_lookup_table, skip_hashtables, 1, hashtable, 1);
+
+  for (int i_tree = 0; i_tree < num_trees; i_tree++){
+    fprintf(stderr,"New bootstrap tree : %d\n",i_tree);
+    char* str = nh_tree1[i_tree];
+    ref_tree  = complete_parse_nh(nh_tree1[i_tree], &taxname_lookup_table, skip_hashtables, k, hashtable, 0); /* sets taxname_lookup_table en passant */
+    tbe_match_doer(ref_tree, NULL, alt_tree, taxname_lookup_table, NULL, quiet, dist_cutoff, 0, k, &(BdictArray->bdict[i_tree]));
+    free_tree(ref_tree);
+  }
+
+  // ref_tree  = complete_parse_nh(nh_tree1, &taxname_lookup_table, skip_hashtables, k); /* sets taxname_lookup_table en passant */
+  
+
+  for(i=0; i < alt_tree->nb_taxa; i++) free(taxname_lookup_table[i]); /* freeing (char*)'s */
+  free(taxname_lookup_table); /* which is a (char**) */
+  free_tree(alt_tree);
+  free_M1M2hashtable(hashtable);
+
+  fprintf(stderr, "Allocated Bipartition Dict Array memory: %p\n", BdictArray);
+
+  // fprintf(stderr, "%d", BdictArray->bdict[0].entries[0]->td[0]);
+  
+  return BdictArray;
+}
+
+
+BipartitionSupportArray* tbe_support (char* nh_tree1, char** nh_tree2, int num_trees) {
+  /* this program takes as input three arguments.
+     Arg1 is the filename of the reference tree.
+     Arg2 is the prefix (including path if necessary) of the trees to be compared to the reference (bootstrapped trees)
+     OR Arg2 is a single file containing all the bootstrap trees, one per line.
+     Arg3 is the name of the output file (output tree with bootstrap values). */
+
+  int i;
+
+
+  Tree *ref_tree;
+
+  int quiet = 0;
+
+  int k=1;
+  
+  int num_threads = 1;
+
+  double dist_cutoff = 0.3;
+
+  opterr = 0;
+  int option_index = 0;
+  int c = 0;
+
+
+
+  if(num_threads>0){
+    if(num_threads > omp_get_max_threads())
+      num_threads = omp_get_max_threads();
+  }else{
+    num_threads = 1;
+  }
+  omp_set_num_threads(num_threads);
+
+
+  /* and then feed this string to the parser */
+  bool rapid = true;
+
+  bool skip_hashtables = rapid;
+
+  char** taxname_lookup_table = NULL;
+
+  M1M2Hashtable* hashtable = new_M1M2hashtable();
+
+  Tree * alt_tree;
+  ref_tree = complete_parse_nh(nh_tree1,  &taxname_lookup_table, skip_hashtables, 1, hashtable, 1);
+
+  BipartitionSupportArray* bsupp_arr = malloc(sizeof(BipartitionSupportArray));
+  bsupp_arr->n_taxa = ref_tree->nb_taxa;
+  bsupp_arr->bipartition_size = split_length(ref_tree->nb_taxa);
+  fprintf(stderr, "split length %d", bsupp_arr->bipartition_size);
+  bsupp_arr->uint_bits = sizeof(unsigned int) * CHAR_BIT;
+  bsupp_arr->num_entries = ref_tree->nb_edges;
+  bsupp_arr->bipartition_supports = malloc(sizeof(BipartitionSupport*)*bsupp_arr->num_entries);
+  for (int i=0; i<bsupp_arr->num_entries; i++) {
+    bsupp_arr->bipartition_supports[i] = malloc(sizeof(BipartitionSupport));
+    bsupp_arr->bipartition_supports[i]->support = 0;
+    bsupp_arr->bipartition_supports[i]->bipartition = (split) calloc(bsupp_arr->bipartition_size, sizeof(unsigned int));
+  }
+  for (int i_tree = 0; i_tree < num_trees; i_tree++){
+    // fprintf(stderr,"New bootstrap tree : %d\n",i_tree);
+    alt_tree  = complete_parse_nh(nh_tree2[i_tree], &taxname_lookup_table, skip_hashtables, k, hashtable, 0); /* sets taxname_lookup_table en passant */
+    tbe_support_doer(ref_tree, NULL, alt_tree, taxname_lookup_table, NULL, quiet, dist_cutoff, 0, bsupp_arr->bipartition_size, bsupp_arr->bipartition_supports);
+    free_tree(alt_tree);
+  }  
+
+  for (int i_bipar=0; i_bipar < ref_tree->nb_edges; i_bipar++){
+    bsupp_arr->bipartition_supports[i_bipar]->support /= num_trees * 1.0;
+  }
+
+  // normalize support value
+
+  for(i=0; i < ref_tree->nb_taxa; i++) free(taxname_lookup_table[i]); /* freeing (char*)'s */
+  free(taxname_lookup_table); /* which is a (char**) */
+  free_tree(ref_tree);
+
+
+  fprintf(stderr, "Allocated Bipartition Support Array memory: %p\n", bsupp_arr);
+  free_M1M2hashtable(hashtable);
+  
+  return bsupp_arr;
+}
+
+
+
+TbeSupportMatchResult* tbe_support_and_match(char* nh_initial_tree, char** nh_input_trees, int num_trees, int k){
+  M1M2Hashtable* hashtable = new_M1M2hashtable();
+  treelist = malloc((num_trees + 1) * sizeof(Tree*));
+  Tree* ref_tree;
+  Tree* alt_tree;
+  bool skip_hashtables = true; // This hashtable is not the new one.
+  char** taxname_lookup_table = NULL;
+  int quiet = 0;
+  /* parse ref_tree*/
+  ref_tree = complete_parse_nh(nh_initial_tree, &taxname_lookup_table, skip_hashtables, 1, hashtable, 0); // k=1, add_hash_count=0
+
+  /* BipartitionSupportArrayHash to be stored the results*/
+  BipartitionSupportArrayHash* bsupp_arr = malloc(sizeof(BipartitionSupportArrayHash));
+  bsupp_arr->n_taxa = ref_tree->nb_taxa;
+  bsupp_arr->bipartition_supports = malloc(ref_tree->nb_nodes * sizeof(BipartitionSupportHash*));
+  int count = 0; 
+  int maximum_id = 0; //for debug
+  for (int i=0; i< ref_tree->nb_nodes; i++){
+    /* Each node should correspond to unique bipartition*/
+    /* Some nodes might be missing, after the result of rerooting. */
+    if (ref_tree->a_nodes[i]!=NULL){
+      IntSet* hash_loc = find_element_M1M2hashtable(hashtable, ref_tree->a_nodes[i]->h1, ref_tree->a_nodes[i]->h2);
+      bsupp_arr->bipartition_supports[hash_loc->bipartition_id] = malloc(sizeof(BipartitionSupportHash));
+      bsupp_arr->bipartition_supports[hash_loc->bipartition_id]->node_id = i;
+      bsupp_arr->bipartition_supports[hash_loc->bipartition_id]->topo_depth = min(ref_tree->a_nodes[i]->subtreesize, ref_tree->nb_taxa-ref_tree->a_nodes[i]->subtreesize);
+      if (ref_tree->a_nodes[i]->nneigh==1 || ref_tree->a_nodes[i]==ref_tree->node0){
+        /* leaf bipartition */
+        bsupp_arr->bipartition_supports[hash_loc->bipartition_id]->is_external = true;
+        bsupp_arr->bipartition_supports[hash_loc->bipartition_id]->support = 1.0; // external node's support is always 1.
+      }else{
+        bsupp_arr->bipartition_supports[hash_loc->bipartition_id]->is_external = false;
+        bsupp_arr->bipartition_supports[hash_loc->bipartition_id]->support = 0.0; // Will be updated by tbe_support_doer function.
+      }
+      maximum_id = max(maximum_id, hash_loc->bipartition_id);
+      count ++;
+    }
+  }
+
+
+  if (maximum_id+1 != count){
+    fprintf(stderr, "Maximum of bipartition ID and number of nodes do not coinicide: %d, %d. Exiting.\n", maximum_id, count);
+    exit(1);
+  }
+
+  bsupp_arr->num_entries = count; 
+  bsupp_arr->num_alt_trees = num_trees;
+
+   //At this point, h1, h2 and is_external is not initialized yet.
+
+  /* parse all alt trees and compute tbe_support.*/
+  for (int i_tree = 0; i_tree < num_trees; i_tree++){
+    // fprintf(stderr, "support: tree %d\n", i_tree);
+    alt_tree  = complete_parse_nh(nh_input_trees[i_tree], &taxname_lookup_table, skip_hashtables, 1, hashtable, 1); // k=k, add_hash_count=1
+    tbe_support_doer_efficient(ref_tree, alt_tree, quiet, bsupp_arr);
+  }  
+
+  /* For determining K */
+  int _count = 0;
+  double transfer_sum = 0;
+
+  for (int i_bipar=0; i_bipar < bsupp_arr->num_entries; i_bipar++){
+    if (!bsupp_arr->bipartition_supports[i_bipar]->is_external){
+      bsupp_arr->bipartition_supports[i_bipar]->support /= num_trees * 1.0; // Divide support value by number of trees.
+      _count ++; // for determining K
+      transfer_sum += bsupp_arr->bipartition_supports[i_bipar]->support;
+    }
+  }
+
+  double mean_transfer_support = transfer_sum/(double)_count;
+
+  // fprintf(stderr, "Mean transfer support: %lf\n", mean_transfer_support);
+
+  /* tbe_match */
+  /* allocate memory for bipartitionDicts*/
+  BipartitionDictHash* bdict = malloc(sizeof(BipartitionDict));
+  bdict->num_entries = hashtable->input_unique_internal_bipar_count;
+  bdict->n_taxa = ref_tree->nb_taxa;
+  bdict->num_matches = k;
+  bdict->entries = malloc(hashtable->input_unique_internal_bipar_count * sizeof(BipartitionMatchesHash*));
+  for (int i=0; i<bdict->num_entries; i++) {
+    bdict->entries[i] = malloc(sizeof(BipartitionMatchesHash));
+    bdict->entries[i]->matched_ids = calloc(k, sizeof(int));
+    bdict->entries[i]->td = calloc(k, sizeof(int));
+  }
+
+  // fprintf(stderr, "Number of unique bipartitions: %d\n", hashtable->input_unique_internal_bipar_count);
+
+  // fprintf(stderr, "number of unique bipartitions %d\n", bdict->num_entries);
+
+  /* tbe match computation */
+  int finished_internal_bipartition_id = -1;
+  for (int i=1; i<num_trees+1; i++){
+    // fprintf(stderr, "match: tree %d\n", i);
+    Tree* alt_tree = treelist[i];
+    realloc_nodes_k(alt_tree, k);
+    finished_internal_bipartition_id = tbe_match_doer_efficient(ref_tree, alt_tree, quiet, k, bdict, finished_internal_bipartition_id);
+    realloc_nodes_k(alt_tree, 1);
+  }
+
+  /* Free all the trees. */
+  // for (int i=0; i<num_trees+1; i++) free_tree(treelist[i]);
+
+  TbeSupportMatchResult* result = malloc(sizeof(TbeSupportMatchResult));
+  result->bdict = bdict;
+  result->bsupp_arr = bsupp_arr;
+
+  // fprintf(stderr, "reached the end of tbe_support_and_match\n");
+
+  return result;
+}
+
+
+void free_bipartition_dict_hash(BipartitionDictHash* bdict){
+  for (int i=0; i<bdict->num_entries; i++){
+    if (bdict->entries[i]!=NULL){
+      if (bdict->entries[i]->matched_ids!=NULL) free(bdict->entries[i]->matched_ids);
+      if (bdict->entries[i]->matched_ids!=NULL) free(bdict->entries[i]->td);
+      free(bdict->entries[i]);
+    }
+  }
+  free(bdict->entries);
+  free(bdict);
+}
+
+void free_bipartition_support_array_hash(BipartitionSupportArrayHash* bsupp_arr){
+  for (int i=0; i<bsupp_arr->num_entries; i++){
+    if (bsupp_arr->bipartition_supports[i]!=NULL)
+      free(bsupp_arr->bipartition_supports[i]);
+  }
+  free(bsupp_arr->bipartition_supports);
+  free(bsupp_arr);
+}
+
+void free_tbe_support_and_match(TbeSupportMatchResult* result){
+  free_M1M2hashtable(treelist[0]->hashtable);
+  for(int i=0; i < treelist[0]->nb_taxa; i++) free(treelist[0]->taxname_lookup_table[i]); /* freeing (char*)'s */
+  free(treelist[0]->taxname_lookup_table);
+  for (int i=0; i<TREE_COUNT; i++) free_tree(treelist[i]);
+  free_bipartition_dict_hash(result->bdict);
+  free_bipartition_support_array_hash(result->bsupp_arr);
+  free(HASH_INTEGERS1);
+  free(HASH_INTEGERS2);
+
+  HASH_INTEGERS1 = NULL;
+  HASH_INTEGERS2 = NULL;
+
+  free(treelist);
+  treelist = NULL;
+  TREE_COUNT = 0;
+
+  free(result);
+}
+
+
+void tbe_support_doer_efficient(Tree *ref_tree,
+         Tree *alt_tree,
+         int quiet,
+         BipartitionSupportArrayHash* bsupp_arr){
+  int m = ref_tree->nb_edges;
+  int n = ref_tree->nb_taxa;
+  int i_tree;
+
+  /** Max number of branches we can see in the bootstrap tree: If it has no multifurcation : binary tree--> ntax*2-2 (if rooted...) */
+  int max_branches_boot = ref_tree->nb_taxa*2-2;
+
+  int *trans_ind = (int*) calloc(m,sizeof(int)); //array of index sums, one
+                                                 //per branch. Initialized to 0.
+                                                 // It is not used here.
+
+  bool skip_hashtables = true;
+
+  Tree *ref_tree_copy = NULL;   // For use with parallel computation.
+
+  if (alt_tree->nb_taxa != n) {
+    fprintf(stderr,"This tree doesn't have the same number of taxa as the reference tree. Skipping.\n");
+    // continue; /* some files maybe not containing trees */
+    return;
+  }
+
+  // if(omp_get_num_threads() > 1)        //If parallel, we copy ref_tree
+  //   ref_tree_copy = copy_tree_rapidTI(ref_tree);
+  // else
+  //   ref_tree_copy = ref_tree;
+
+  compute_transfer_indices_fast(ref_tree, n, m, alt_tree,
+                                trans_ind, 1);
+
+  // if(omp_get_num_threads() > 1)
+  //   free_tree(ref_tree_copy);
+
+  double bootstrap_val, avg_dist;
+
+
+  /* UPDATE REF TREE WITH BOOTSTRAP VALUES */
+
+
+  for (int i = 0; i < bsupp_arr->num_entries; i++){
+    if (bsupp_arr->bipartition_supports[i]->is_external) continue;
+    /* Internal node. */
+    int node_id = bsupp_arr->bipartition_supports[i]->node_id;
+    double td = min(ref_tree->a_nodes[node_id]->ti_min[0], ref_tree->nb_taxa - ref_tree->a_nodes[node_id]->ti_max[0]);
+    double topo_depth = min(ref_tree->a_nodes[node_id]->subtreesize, ref_tree->nb_taxa-ref_tree->a_nodes[node_id]->subtreesize);
+    bsupp_arr->bipartition_supports[i] -> support += (double) 1.0 - td / (topo_depth-1.0);
+  }
+
+  
+  free(trans_ind);
+  // for(i_tree=0; i_tree < num_trees;i_tree++){
+  //   free(trans_ind_tmp[i_tree]);
+  // }
+  // free(trans_ind_tmp);
+
+  // free(moved_species_counts);
+}
+
+
+int tbe_match_doer_efficient(Tree *ref_tree, 
+         Tree *alt_tree,
+         int quiet,
+         int k,
+         BipartitionDictHash* bdict,
+         int finished_internal_bipartition_id){
+  int m = alt_tree->nb_edges;
+  int n = ref_tree->nb_taxa;
+  int i_tree;
+  /** Max number of branches we can see in the bootstrap tree: If it has no multifurcation : binary tree--> ntax*2-2 (if rooted...) */
+  int max_branches_boot = ref_tree->nb_taxa*2-2;
+
+  int *trans_ind = (int*) calloc(m,sizeof(int)); //array of index sums, one
+                                                 //per branch. Initialized to 0.
+
+  bool skip_hashtables = true;
+  Tree *ref_tree_copy = NULL;   // For use with parallel computation.
+
+
+  if (alt_tree->nb_taxa != n) {
+    fprintf(stderr,"This tree doesn't have the same number of taxa as the reference tree. Skipping.\n");
+    // continue; /* some files maybe not containing trees */
+    return -1;
+  }
+
+  // if(omp_get_num_threads() > 1)        //If parallel, we copy ref_tree
+  //   ref_tree_copy = copy_tree_rapidTI(ref_tree);
+  // else
+  //   ref_tree_copy = ref_tree;
+
+  compute_transfer_indices_fast(alt_tree, n, m, ref_tree,
+                                trans_ind, k);
+
+  // if(omp_get_num_threads() > 1)
+  //   free_tree(ref_tree_copy);
+
+  double bootstrap_val, avg_dist;
+
+  /* Copy the result of tbe_match to bdict */
+  int* order_array = calloc(k, sizeof(int));
+  int* temporary_array = calloc(k, sizeof(int));
+
+  int max_bipartition_id = finished_internal_bipartition_id;
+  for (int i=0; i<alt_tree->nb_nodes; i++){
+    if (alt_tree->a_nodes[i]!=NULL && alt_tree->a_nodes[i]->nneigh!=1 && alt_tree->a_nodes[i] != alt_tree->node0){
+      /* Internal node. */
+      IntSet* hash_loc = find_element_M1M2hashtable(ref_tree->hashtable, alt_tree->a_nodes[i]->h1, alt_tree->a_nodes[i]->h2);
+      int bipar_id = hash_loc->input_internal_bipartition_id;
+      // Then update bdict->entries
+      if (bipar_id > finished_internal_bipartition_id){
+        // new bipartition; update bdict->entries[bipar_id]
+        bdict->entries[bipar_id]->h1 = alt_tree->a_nodes[i]->h1;
+        bdict->entries[bipar_id]->h2 = alt_tree->a_nodes[i]->h2;
+        bdict->entries[bipar_id]->topo_depth = min(alt_tree->a_nodes[i]->subtreesize, alt_tree->nb_taxa - alt_tree->a_nodes[i]->subtreesize);
+        bdict->entries[bipar_id]->input_count = hash_loc->input_count;
+        for (int j=0; j<k; ++j) temporary_array[j] = alt_tree->nb_taxa - alt_tree->a_nodes[i]->ti_max[j];
+        // fprintf(stderr, "temporary array %d %d %d %d %d\n", temporary_array[0], temporary_array[1], temporary_array[2], temporary_array[3], temporary_array[4]);
+        compare_two_sorted_ascending(alt_tree->a_nodes[i]->ti_min, temporary_array, order_array, k, k, k);
+        set_int_array_from_order_2(alt_tree->a_nodes[i]->ti_min, temporary_array, bdict->entries[bipar_id]->td, order_array, k);
+        /* set bipartition id of the matched elements*/
+        int min_count = 0; int max_count = 0;
+        for (int j=0; j<k; j++){
+          if (order_array[j]==0) {
+            bdict->entries[bipar_id]->matched_ids[j] = find_element_M1M2hashtable(ref_tree->hashtable, alt_tree->a_nodes[i]->min_node[min_count]->h1,alt_tree->a_nodes[i]->min_node[min_count]->h2)->ref_id;
+            min_count ++;
+          }else{
+            // First check if access to each element does not cause a segmentation fault
+            // Try accessing each element with fprintf
+            if (alt_tree->a_nodes[i] == NULL) {
+                fprintf(stderr, "Error: alt_tree->a_nodes[%d] is NULL.\n", i);
+                exit(EXIT_FAILURE); // Or handle the error appropriately
+            }
+            
+            if (alt_tree->a_nodes[i]->max_node == NULL) {
+                fprintf(stderr, "Error: alt_tree->a_nodes[%d]->max_node is NULL.\n", i);
+                exit(EXIT_FAILURE); // Or handle the error appropriately
+            }
+            
+            if (alt_tree->a_nodes[i]->max_node[max_count] == NULL) {
+                fprintf(stderr, "Error: alt_tree->a_nodes[%d]->max_node[%d] is NULL.\n", i, max_count);
+                exit(EXIT_FAILURE); // Or handle the error appropriately
+            }
+            IntSet* hash_loc = find_element_M1M2hashtable(ref_tree->hashtable, alt_tree->a_nodes[i]->max_node[max_count]->h1,alt_tree->a_nodes[i]->max_node[max_count]->h2);
+            if (hash_loc == NULL) {
+              fprintf(stderr, "Error: Hash value not found");
+              exit(EXIT_FAILURE); // Or handle the error appropriately
+            }
+            // Extract the ref_id
+            int ref_id = hash_loc->ref_id;
+            // Assign the value to matched_ids
+            if (bdict->entries[bipar_id] == NULL) {
+              fprintf(stderr, "Error: bdict->entries[%d] is NULL.\n", bipar_id);
+              exit(EXIT_FAILURE); // Or handle the error appropriately
+            }
+            if (bdict->entries[bipar_id]->matched_ids == NULL) {
+              fprintf(stderr, "Error: bdict->entries[%d]->matched_ids is NULL.\n", bipar_id);
+              exit(EXIT_FAILURE); // Or handle the error appropriately
+            }
+            bdict->entries[bipar_id]->matched_ids[j] = ref_id;
+            max_count ++;
+          }
+        }
+        max_bipartition_id = max(max_bipartition_id, bipar_id);
+      }
+    }
+  } // Renewal of bdict finished.
+
+  free(order_array);
+  free(temporary_array);
+  free(trans_ind);
+
+  return max_bipartition_id;
+}
+
+
+
+/* Function used for recomputation of transfer distance to all. */
+transferDistanceAll* recompute(unsigned int h1, unsigned int h2){
+  if (TDA_LIST==NULL) init_TDA_LIST();
+	Edge* edge_to_recomp = retrieve_edge(h1, h2, treelist[0]->hashtable, treelist);
+  transferDistanceAll* tda =  transfer_distance_all_fast(edge_to_recomp, treelist[0], treelist[0]->nb_taxa, h1, h2);
+  TDA_LIST_append(tda);
+  return tda;
+}
+
+void free_TDA_LIST(){
+  if (TDA_LIST==NULL) return;
+  for (int i=0; i<TDA_LIST->num_memory; i++){
+    if (TDA_LIST->tda_list[i]!=NULL){
+      free_transfer_distance_all(TDA_LIST->tda_list[i]);
+    }
+  }
+  free(TDA_LIST->tda_list);
+  free(TDA_LIST);
+}
+
+
+
+char* prune_and_return_newick(int* node_ids, int n_nodes_to_remove){
+  prune_branches(treelist[0], node_ids, n_nodes_to_remove);
+  size_t capacity = 1024;
+  size_t offset = 0;
+  char* buffer = malloc(capacity);
+
+  if (treelist[0]->outgroup_node !=NULL) addback_root_leaf(treelist[0]);
+
+  write_nh_tree_to_buffer(treelist[0], &buffer, &capacity, &offset, true);
+
+  // fprintf(stderr, "%s", buffer);
+
+  return buffer;
+}
+
+void free_buffer(char* string){
+  free(string);
+}
+
+
+
+void fbp(Tree *ref_tree, char **alt_tree_strings,char** taxname_lookup_table, int num_trees, int quiet){
+  int j;
+  Tree *alt_tree;
+  Edge *edge;
+  int i_tree,i;
+  short unsigned* nb_found = malloc(ref_tree->nb_edges * sizeof(short unsigned));
+  double support;
+  // We initialize the reference edge hashmap
+  bitset_hashmap *hm = new_bitset_hashmap(ref_tree->nb_edges*2, 0.75);
+
+  for(i=0; i< ref_tree->nb_edges; i++){
+    nb_found[i] = 0;
+    edge = ref_tree->a_edges[i];
+    if(edge == NULL || edge->hashtbl == NULL) continue;
+    bitset_hashmap_putvalue(hm, edge->hashtbl, ref_tree->nb_taxa, i);
+  }
+
+ 
+#pragma omp parallel for private( j, alt_tree, support) shared(nb_found, hm, ref_tree, alt_tree_strings, taxname_lookup_table, quiet, num_trees) schedule(dynamic)
+  for(i_tree=0; i_tree< num_trees; i_tree++){
+    if(!quiet) fprintf(stderr,"New bootstrap tree : %d\n",i_tree);
+    alt_tree = complete_parse_nh(alt_tree_strings[i_tree], &taxname_lookup_table, false, 1, ref_tree->hashtable, 1);
+    
+    if (alt_tree == NULL) {
+      fprintf(stderr,"Not a correct NH tree (%d). Skipping.\n%s\n",i_tree,alt_tree_strings[i_tree]);
+      continue; /* some files maybe not containing trees */
+    }
+    if (alt_tree->nb_taxa != ref_tree->nb_taxa) {
+      fprintf(stderr,"This tree doesn't have the same number of taxa as the reference tree. Skipping.\n");
+      free_tree(alt_tree);
+      continue; /* some files maybe not containing trees */
+    }
+
+    /****************************************************/
+    /*     comparison of the bipartitions, FBP method   */
+    /****************************************************/		  
+    for (j = 0; j <  alt_tree->nb_edges; j++) {
+      edge = alt_tree->a_edges[j];
+      if(edge == NULL || edge->hashtbl == NULL) continue;
+      // We query the hashmap to see if the edge is present, and then get its reference index
+      int refindex = bitset_hashmap_value(hm, edge->hashtbl, alt_tree->nb_taxa);
+      if (refindex>-1){
+        #pragma omp atomic update
+        nb_found[refindex]++;
+      }
+    }
+    free_tree(alt_tree);
+  }
+
+  if(num_trees != 0) {
+    for (i = 0; i <  ref_tree->nb_edges; i++) {
+      edge = ref_tree->a_edges[i];
+      if(edge == NULL || edge->right == NULL) continue;
+      if(edge->right->nneigh == 1) { continue; }
+      /* the bootstrap value for a branch is inscribed as the name of its descendant (always right side of the edge, by convention) */
+      if(edge->right->name){
+        free(edge->right->name); /* clear name if existing */
+      }
+      edge->right->name = (char*) malloc(16 * sizeof(char));
+      support   = (double) nb_found[i] * 1.0 / num_trees;
+      sprintf(edge->right->name, "%.6f", support);
+      edge->branch_support = support;
+      edge->has_branch_support = true;
+    }
+  }
+  free(nb_found);
+  free_bitset_hashmap(hm);
+
+  // Reinsert outgroup node if it was temporarily removed by parser.
+  if (ref_tree->outgroup_node != NULL) addback_root_leaf(ref_tree);
+}
+
+void tbe(bool rapid, Tree *ref_tree, Tree *ref_raw_tree,
+         char **alt_tree_strings, char** taxname_lookup_table, FILE *stat_file,
+         int num_trees, int quiet, double dist_cutoff, int count_per_branch, int k){
+  int m = ref_tree->nb_edges;
+  int n = ref_tree->nb_taxa;
+  int i_tree;
+  int **trans_ind_tmp;
+  double *moved_species_counts;  /* array of average branch rate in which each taxon moves */
+  /** Max number of branches we can see in the bootstrap tree: If it has no multifurcation : binary tree--> ntax*2-2 (if rooted...) */
+  int max_branches_boot = ref_tree->nb_taxa*2-2;
+
+  /* array a[i][j] of number of bootstrap tree from which each taxon j moves around the branch i and that are closer than given distance */
+  int **moved_species_counts_per_branch = NULL;
+
+  if(stat_file != NULL && count_per_branch && !rapid){
+    moved_species_counts_per_branch = (int**) calloc(m,sizeof(int*));
+    for(int i=0;i<m;i++){
+      moved_species_counts_per_branch[i]  = (int*) calloc(n,sizeof(int));
+    }
+  }
+
+  trans_ind_tmp = (int**) calloc(num_trees,sizeof(int*)); /* array of index sums, one per boot tree and branch. Initialized to 0. */
+  for(i_tree=0; i_tree< num_trees; i_tree++)
+    trans_ind_tmp[i_tree]  = (int*) calloc(m,sizeof(int)); /* array of index sums, one per branch. Initialized to 0. */
+
+  bool skip_hashtables = rapid;
+  #ifdef COMPARE_TBE_METHODS
+  skip_hashtables = false;
+  int **trans_ind_fast;
+  trans_ind_fast = (int**) calloc(num_trees,sizeof(int*)); /* array of index sums, one per boot tree and branch. Initialized to 0. */
+  for(i_tree=0; i_tree< num_trees; i_tree++)
+    trans_ind_fast[i_tree]  = (int*) calloc(m,sizeof(int)); /* array of index sums, one per branch. Initialized to 0. */
+  #endif
+
+  moved_species_counts = (double*) calloc(m,sizeof(double)); /* array of average branch rate in which each taxon moves */
+
+  Tree *alt_tree;
+  Tree *ref_tree_copy = NULL;   // For use with parallel computation.
+  #ifdef COMPARE_TBE_METHODS
+  #pragma omp parallel for private(alt_tree, ref_tree_copy) shared(ref_tree, max_branches_boot, alt_tree_strings, trans_ind_tmp, trans_ind_fast, taxname_lookup_table, n, m, moved_species_counts, moved_species_counts_per_branch) schedule(dynamic)
+  #else
+  #pragma omp parallel for private(alt_tree, ref_tree_copy) shared(ref_tree, max_branches_boot, alt_tree_strings, trans_ind_tmp, taxname_lookup_table, n, m, moved_species_counts, moved_species_counts_per_branch) schedule(dynamic)
+  #endif
+  
+  for(i_tree=0; i_tree< num_trees; i_tree++){
+    if(!quiet) fprintf(stderr,"New bootstrap tree : %d\n",i_tree);
+    alt_tree = complete_parse_nh(alt_tree_strings[i_tree], &taxname_lookup_table, skip_hashtables, 1, ref_tree->hashtable, 1);
+    
+    print_hashtable(alt_tree->hashtable);
+
+    if (alt_tree == NULL) {
+      fprintf(stderr,"Not a correct NH tree (%d). Skipping.\n%s\n",i_tree,alt_tree_strings[i_tree]);
+      continue; /* some files maybe not containing trees */
+    }
+    if (alt_tree->nb_taxa != n) {
+      fprintf(stderr,"This tree doesn't have the same number of taxa as the reference tree. Skipping.\n");
+      continue; /* some files maybe not containing trees */
+    }
+
+    #ifndef COMPARE_TBE_METHODS
+    if (rapid) {
+      if(omp_get_num_threads() > 1)        //If parallel, we copy ref_tree
+        ref_tree_copy = copy_tree_rapidTI(ref_tree);
+      else
+        ref_tree_copy = ref_tree;
+
+
+      #ifdef ASSUME_BALANCED
+      compute_transfer_indices_fast_BALANCED(ref_tree_copy, n, m, alt_tree,
+                                             trans_ind_tmp[i_tree]);
+      #else
+      compute_transfer_indices_fast(ref_tree_copy, n, m, alt_tree,
+                                    trans_ind_tmp[i_tree], k);
+      #endif
+      // fprintf(stderr, "%d\n", trans_ind_tmp[i_tree][1]);
+
+
+      if(omp_get_num_threads() > 1)
+        free_tree(ref_tree_copy);
+    }
+    else
+      compute_transfer_indices(ref_tree, n, m, alt_tree, trans_ind_tmp[i_tree],
+                               max_branches_boot, moved_species_counts,
+                               moved_species_counts_per_branch,
+                               count_per_branch, dist_cutoff);
+
+    #else             //COMPARE_TBE_METHODS
+      //This compares the old and rapid methods:
+    if(omp_get_num_threads() > 1)
+      ref_tree_copy = copy_tree_rapidTI(ref_tree);
+    else
+      ref_tree_copy = ref_tree;
+
+    #ifdef ASSUME_BALANCED
+    compute_transfer_indices_fast_BALANCED(ref_tree_copy, n, m, alt_tree,
+                                           trans_ind_fast[i_tree]);
+    #else
+    compute_transfer_indices_fast(ref_tree_copy, n, m, alt_tree,
+                                  trans_ind_fast[i_tree]);
+    #endif
+
+    if(omp_get_num_threads() > 1)
+      free_tree(ref_tree_copy);
+
+    compute_transfer_indices(ref_tree, n, m, alt_tree, trans_ind_tmp[i_tree],
+                             max_branches_boot, moved_species_counts,
+                             moved_species_counts_per_branch,
+                             count_per_branch, dist_cutoff);
+
+    assert_equal_TI(trans_ind_fast[i_tree], trans_ind_tmp[i_tree], ref_tree);
+    #endif
+    free_tree(alt_tree);
+  }
+  #pragma omp barrier
+
+  int *trans_ind = (int*) calloc(m,sizeof(int)); //array of index sums, one
+                                                 //per branch. Initialized to 0.
+  for (int i = 0; i < m; i++){
+    for(i_tree=0; i_tree < num_trees; i_tree++){
+      trans_ind[i] += trans_ind_tmp[i_tree][i];
+    }
+  }
+
+  double bootstrap_val, avg_dist;
+
+  if(num_trees != 0) {
+    if(stat_file != NULL)
+      fprintf(stat_file,"EdgeId\tDepth\tMeanMinDist\n");
+
+    /* OUTPUT FINAL STATISTICS and UPDATE REF TREE WITH BOOTSTRAP VALUES */
+    for (int i = 0; i <  ref_tree->nb_edges; i++) {
+      if(ref_tree->a_edges[i] == NULL) continue;
+      if(ref_tree->a_edges[i]->right->nneigh == 1) { continue; }
+
+      /* the bootstrap value for a branch is inscribed as the name of its descendant (always right side of the edge, by convention) */
+      if(ref_tree->a_edges[i]->right->name){
+        free(ref_tree->a_edges[i]->right->name); /* clear name if existing */
+      }
+      // fprintf(stderr, "Two should be the same value, %d = %d\n", trans_ind[i], 
+      //       min(ref_tree->nb_taxa - ref_tree->a_edges[i]->right->ti_max[0], ref_tree->a_edges[i]->right->ti_min[0]));
+
+      ref_tree->a_edges[i]->right->name = (char*) malloc(16 * sizeof(char));
+      avg_dist      = (double) trans_ind[i] * 1.0 / num_trees;
+      bootstrap_val = (double) 1.0 - avg_dist * 1.0 / (1.0 * ref_tree->a_edges[i]->topo_depth-1.0);
+
+      if(stat_file != NULL)
+        fprintf(stat_file,"%d\t%d\t%f\n", i, (ref_tree->a_edges[i]->topo_depth), avg_dist);
+
+      sprintf(ref_tree->a_edges[i]->right->name, "%.6f", bootstrap_val);
+
+      ref_tree->a_edges[i]->branch_support = bootstrap_val;
+      
+      if(ref_raw_tree!=NULL){
+        /* the bootstrap value for a branch is inscribed as the name of its descendant as id|avgdist|depth */
+        if(ref_raw_tree->a_edges[i]->right->name){
+          free(ref_raw_tree->a_edges[i]->right->name); /* clear name if existing */
+        }
+        ref_raw_tree->a_edges[i]->right->name = (char*) malloc(16 * sizeof(char));
+        avg_dist      = (double) trans_ind[i] * 1.0 / num_trees;
+        sprintf(ref_raw_tree->a_edges[i]->right->name, "%d|%.6f|%d", ref_raw_tree->a_edges[i]->id, avg_dist,ref_tree->a_edges[i]->topo_depth);
+      }
+    }
+
+    if(stat_file != NULL){
+      fprintf(stat_file,"Taxon\ttIndex\n");
+      for(int i=0; i<n;i++){
+        fprintf(stat_file,"%s\t%f\n", taxname_lookup_table[i], moved_species_counts[i]*100.0 / ((double)num_trees));
+      }
+    }
+  }
+
+  if(stat_file != NULL && count_per_branch){
+    fprintf(stat_file,"Edge\tSupport");
+    for(int i=0; i<n;i++){
+      fprintf(stat_file,"\t%s", taxname_lookup_table[i]);
+    }
+    fprintf(stat_file,"\n");
+    for(int i=0; i<m;i++){
+      if(ref_tree->a_edges[i]->right->nneigh == 1) { continue; }
+      fprintf(stat_file,"%d\t%s", i,ref_tree->a_edges[i]->right->name);
+      for(int j=0;j<n;j++){
+        fprintf(stat_file,"\t%f",moved_species_counts_per_branch[i][j]*1.0/num_trees);
+      }
+      fprintf(stat_file,"\n");
+    }
+    for(int i=0;i<m;i++){
+      free(moved_species_counts_per_branch[i]);
+    }
+    free(moved_species_counts_per_branch);
+  }
+  
+  free(trans_ind);
+  for(i_tree=0; i_tree < num_trees;i_tree++){
+    free(trans_ind_tmp[i_tree]);
+  }
+  free(trans_ind_tmp);
+
+  #ifdef COMPARE_TBE_METHODS
+  for(i_tree=0; i_tree < num_trees;i_tree++)
+    free(trans_ind_fast[i_tree]);
+  free(trans_ind_fast);
+  #endif
+
+  free(moved_species_counts);
+
+  // Reinsert outgroup node if exists
+  if (ref_tree->outgroup_node !=NULL) addback_root_leaf(ref_tree);
+}
+
+void tbe_match_doer(Tree *ref_tree, Tree *ref_raw_tree,
+         Tree *alt_tree, char** taxname_lookup_table, FILE *stat_file,
+         int quiet, double dist_cutoff, int count_per_branch, int k,
+         BipartitionDict* bdict){
+  int m = ref_tree->nb_edges;
+  int n = ref_tree->nb_taxa;
+  int i_tree;
+  // int **trans_ind_tmp;
+  // double *moved_species_counts;  /* array of average branch rate in which each taxon moves */
+  /** Max number of branches we can see in the bootstrap tree: If it has no multifurcation : binary tree--> ntax*2-2 (if rooted...) */
+  int max_branches_boot = ref_tree->nb_taxa*2-2;
+
+  /* array a[i][j] of number of bootstrap tree from which each taxon j moves around the branch i and that are closer than given distance */
+  // int **moved_species_counts_per_branch = NULL;
+
+  // trans_ind_tmp = (int**) calloc(num_trees,sizeof(int*)); /* array of index sums, one per boot tree and branch. Initialized to 0. */
+  // for(i_tree=0; i_tree< num_trees; i_tree++)
+  //   trans_ind_tmp[i_tree]  = (int*) calloc(m,sizeof(int)); /* array of index sums, one per branch. Initialized to 0. */
+
+  int *trans_ind = (int*) calloc(m,sizeof(int)); //array of index sums, one
+                                                 //per branch. Initialized to 0.
+
+  bool skip_hashtables = true;
+
+  // moved_species_counts = (double*) calloc(m,sizeof(double)); /* array of average branch rate in which each taxon moves */
+
+  Tree *ref_tree_copy = NULL;   // For use with parallel computation.
+
+  // i_tree=0;
+
+
+  if (alt_tree->nb_taxa != n) {
+    fprintf(stderr,"This tree doesn't have the same number of taxa as the reference tree. Skipping.\n");
+    // continue; /* some files maybe not containing trees */
+    return;
+  }
+
+  // if(omp_get_num_threads() > 1)        //If parallel, we copy ref_tree
+  //   ref_tree_copy = copy_tree_rapidTI(ref_tree);
+  // else
+  //   ref_tree_copy = ref_tree;
+
+  compute_transfer_indices_fast(ref_tree, n, m, alt_tree,
+                                trans_ind, k);
+
+  // if(omp_get_num_threads() > 1)
+  //   free_tree(ref_tree_copy);
+
+  // int *trans_ind = (int*) calloc(m,sizeof(int)); //array of index sums, one
+  //                                                //per branch. Initialized to 0.
+  // for (int i = 0; i < m; i++){
+  //   for(i_tree=0; i_tree < num_trees; i_tree++){
+  //     trans_ind[i] += trans_ind_tmp[i_tree][i];
+  //   }
+  // }
+
+  double bootstrap_val, avg_dist;
+
+
+    /*Bipartition Dict: Initialization*/
+    unsigned int spl = split_length(ref_tree->nb_taxa);
+    bdict->uint_bits = sizeof(unsigned int) * CHAR_BIT;
+    bdict->num_entries = ref_tree->nb_edges;
+    bdict->entries = (BipartitionMatches**) malloc(sizeof(BipartitionMatches*) * bdict->num_entries);
+    bdict->bipartition_size = spl;
+    bdict->num_matches = k;
+    bdict->n_taxa = ref_tree->nb_taxa;
+    for(int i=0; i<bdict->num_entries; i++){
+      bdict->entries[i] = (BipartitionMatches*) malloc(sizeof(BipartitionMatches));
+      bdict->entries[i]->matches = (split *) malloc(sizeof(split)*k);
+      for (int j=0; j<k; j++){
+        bdict->entries[i]->matches[j] = (split) calloc(spl, sizeof(unsigned int));
+      }
+      bdict->entries[i]->td = (int *) calloc(k, sizeof(int));
+      bdict->entries[i]->bipartition = (split) calloc(spl, sizeof(unsigned int));
+    }
+
+    // after_tbe_match(bdict);
+
+    // fprintf(stderr, "SUCCESSFULLY FreeD\n");
+
+    /* OUTPUT FINAL STATISTICS and UPDATE REF TREE WITH BOOTSTRAP VALUES */
+    int* order_array = calloc(k, sizeof(int));
+    int* temporary_array = calloc(k, sizeof(int));
+    for (int i = 0; i <  ref_tree->nb_edges; i++) {
+      if(ref_tree->a_edges[i]->right->nneigh == 1 || ref_tree->a_edges[i]->topo_depth==1) {
+        set_bit(bdict->entries[i]->bipartition, ref_tree->a_edges[i]->right->leaf_id);
+        bdict->entries[i]->is_external=true;
+        bdict->entries[i]->topo_depth = 1;
+        // print_bitvector(bdict->entries[i]->bipartition, bdict->n_taxa);
+        // fprintf(stderr, "%u\n", bdict->entries[i]->bipartition[0]);
+        continue; }
+      bdict->entries[i]->is_external=false;
+
+      /* the bootstrap value for a branch is inscribed as the name of its descendant (always right side of the edge, by convention) */
+      if(ref_tree->a_edges[i]->right->name){
+        free(ref_tree->a_edges[i]->right->name); /* clear name if existing */
+      }
+      // fprintf(stderr, "Two should be the same value, %d = %d\n", trans_ind[i], 
+      //       min(ref_tree->nb_taxa - ref_tree->a_edges[i]->right->ti_max[0], ref_tree->a_edges[i]->right->ti_min[0]));
+
+
+      /*Set bdict*/
+      // fprintf(stderr, "%d\n", ref_tree->a_edges[i]->right->subtree_split[0]);
+      bdict->entries[i]->topo_depth = ref_tree->a_edges[i]->topo_depth;
+      for (int j=0; j<spl; ++j) bdict->entries[i]->bipartition[j] = ref_tree->a_edges[i]->right->subtree_split[j];
+      for (int j=0; j<k; ++j) temporary_array[j] = ref_tree->nb_taxa - ref_tree->a_edges[i]->right->ti_max[j];
+      compare_two_sorted_ascending(ref_tree->a_edges[i]->right->ti_min, temporary_array, order_array, 
+                                            k, k, k);
+      set_int_array_from_order_2(ref_tree->a_edges[i]->right->ti_min, temporary_array, 
+                  bdict->entries[i]->td, order_array, k);
+      set_split_array_from_order_2(ref_tree->a_edges[i]->right->min_node, ref_tree->a_edges[i]->right->max_node,
+                   bdict->entries[i]->matches, order_array, k, spl);
+
+      
+      // print_bitvector(bdict->entries[i]->bipartition, bdict->n_taxa);
+      // fprintf(stderr, "%u\n", bdict->entries[i]->bipartition[0]);
+
+      ref_tree->a_edges[i]->right->name = (char*) malloc(16 * sizeof(char));
+      avg_dist      = (double) trans_ind[i] * 1.0;
+      bootstrap_val = (double) 1.0 - avg_dist * 1.0 / (1.0 * ref_tree->a_edges[i]->topo_depth-1.0);
+
+
+      sprintf(ref_tree->a_edges[i]->right->name, "%.6f", bootstrap_val);
+
+      ref_tree->a_edges[i]->branch_support = bootstrap_val;
+      
+      if(ref_raw_tree!=NULL){
+        /* the bootstrap value for a branch is inscribed as the name of its descendant as id|avgdist|depth */
+        if(ref_raw_tree->a_edges[i]->right->name){
+          free(ref_raw_tree->a_edges[i]->right->name); /* clear name if existing */
+        }
+        ref_raw_tree->a_edges[i]->right->name = (char*) malloc(16 * sizeof(char));
+        avg_dist      = (double) trans_ind[i] * 1.0;
+        sprintf(ref_raw_tree->a_edges[i]->right->name, "%d|%.6f|%d", ref_raw_tree->a_edges[i]->id, avg_dist,ref_tree->a_edges[i]->topo_depth);
+      }
+    }
+
+    free(order_array);
+    free(temporary_array);
+
+  
+  free(trans_ind);
+  // for(i_tree=0; i_tree < num_trees;i_tree++){
+  //   free(trans_ind_tmp[i_tree]);
+  // }
+  // free(trans_ind_tmp);
+
+  // free(moved_species_counts);
+}
+
+void tbe_support_doer(Tree *ref_tree, Tree *ref_raw_tree,
+         Tree *alt_tree, char** taxname_lookup_table, FILE *stat_file,
+         int quiet, double dist_cutoff, int count_per_branch, int spl,
+         BipartitionSupport** bsupp){
+  int m = ref_tree->nb_edges;
+  int n = ref_tree->nb_taxa;
+  int i_tree;
+  // int **trans_ind_tmp;
+  // double *moved_species_counts;  /* array of average branch rate in which each taxon moves */
+  /** Max number of branches we can see in the bootstrap tree: If it has no multifurcation : binary tree--> ntax*2-2 (if rooted...) */
+  int max_branches_boot = ref_tree->nb_taxa*2-2;
+
+  /* array a[i][j] of number of bootstrap tree from which each taxon j moves around the branch i and that are closer than given distance */
+  // int **moved_species_counts_per_branch = NULL;
+
+  // trans_ind_tmp = (int**) calloc(num_trees,sizeof(int*)); /* array of index sums, one per boot tree and branch. Initialized to 0. */
+  // for(i_tree=0; i_tree< num_trees; i_tree++)
+  //   trans_ind_tmp[i_tree]  = (int*) calloc(m,sizeof(int)); /* array of index sums, one per branch. Initialized to 0. */
+
+  int *trans_ind = (int*) calloc(m,sizeof(int)); //array of index sums, one
+                                                 //per branch. Initialized to 0.
+
+  bool skip_hashtables = true;
+
+  // moved_species_counts = (double*) calloc(m,sizeof(double)); /* array of average branch rate in which each taxon moves */
+
+  Tree *ref_tree_copy = NULL;   // For use with parallel computation.
+
+  // i_tree=0;
+
+
+  if (alt_tree->nb_taxa != n) {
+    fprintf(stderr,"This tree doesn't have the same number of taxa as the reference tree. Skipping.\n");
+    // continue; /* some files maybe not containing trees */
+    return;
+  }
+
+  // if(omp_get_num_threads() > 1)        //If parallel, we copy ref_tree
+  //   ref_tree_copy = copy_tree_rapidTI(ref_tree);
+  // else
+  //   ref_tree_copy = ref_tree;
+
+  compute_transfer_indices_fast(ref_tree, n, m, alt_tree,
+                                trans_ind, 1);
+
+  // if(omp_get_num_threads() > 1)
+  //   free_tree(ref_tree_copy);
+
+  // int *trans_ind = (int*) calloc(m,sizeof(int)); //array of index sums, one
+  //                                                //per branch. Initialized to 0.
+  // for (int i = 0; i < m; i++){
+  //   for(i_tree=0; i_tree < num_trees; i_tree++){
+  //     trans_ind[i] += trans_ind_tmp[i_tree][i];
+  //   }
+  // }
+
+  double bootstrap_val, avg_dist;
+
+    // after_tbe_match(bdict);
+
+    // fprintf(stderr, "SUCCESSFULLY FreeD\n");
+
+    /* OUTPUT FINAL STATISTICS and UPDATE REF TREE WITH BOOTSTRAP VALUES */
+    for (int i = 0; i <  ref_tree->nb_edges; i++) {
+      if(ref_tree->a_edges[i]->right->nneigh == 1 || ref_tree->a_edges[i]->topo_depth==1) {
+        if (ref_tree->a_edges[i]->right->nneigh != 1){
+          memcpy(bsupp[i]->bipartition, ref_tree->a_edges[i]->right->subtree_split, spl * sizeof(unsigned int));
+        }else{
+          set_bit(bsupp[i]->bipartition, ref_tree->a_edges[i]->right->leaf_id);
+        }
+        bsupp[i]->is_external=true;
+        bsupp[i]->support += (double) 1.0;
+        continue; }
+      bsupp[i]->is_external=false;
+
+      /*Set bdict*/
+      // fprintf(stderr, "%d\n", ref_tree->a_edges[i]->right->subtree_split[0]);
+      for (int j=0; j<spl; ++j) bsupp[i]->bipartition[j] = ref_tree->a_edges[i]->right->subtree_split[j];
+
+      bsupp[i] -> support += (double) 1.0 - trans_ind[i] * 1.0 / (1.0 * ref_tree->a_edges[i]->topo_depth-1.0);
+    }
+
+  
+  free(trans_ind);
+  // for(i_tree=0; i_tree < num_trees;i_tree++){
+  //   free(trans_ind_tmp[i_tree]);
+  // }
+  // free(trans_ind_tmp);
+
+  // free(moved_species_counts);
+}
+
+
+/*
+Compare old and new (rapid) bootstrap calculations.
+*/
+void assert_equal_TI(int *ti_new, int *ti_old, Tree *ref_tree) {
+  bool same = true;
+  for(int i=0; i < ref_tree->nb_edges; i++) {
+    if(ti_new[i] != ti_old[i]) {
+      same = false;
+      fprintf(stderr, "mismatch: pos %d new %d old %d\n", i,
+              ti_new[i], ti_old[i]);
+      fprintf(stderr, "    node ti_min: %i\n", ref_tree->a_edges[i]->right->ti_min[0]);
+      fprintf(stderr, "    "); print_node(ref_tree->a_edges[i]->right);
+    }
+  }
+  if(!same)
+    exit(0);
+  fprintf(stderr, "comparison done.\n");
+}
+
+
+void after_tbe_match(BipartitionDictArray* bdictarray) {
+    if (bdictarray == NULL) {
+        fprintf(stderr, "BipartitionDict is NULL, nothing to free.\n");
+        return;
+    }
+    
+    fprintf(stderr, "Freeing Bipartition Dict memory: %p\n", bdictarray);
+    for (int l=0; l<bdictarray->num_trees; l++){
+      BipartitionDict* bdict = &(bdictarray->bdict[l]);
+      if (bdict == NULL) fprintf(stderr, "bdict is null");
+      int n_entries = bdict->num_entries;
+      
+      if (bdict->entries != NULL) {
+          for (int i = 0; i < n_entries; i++) {
+              if (bdict->entries[i] != NULL) {
+                  for (int j = 0; j < bdict->num_matches; ++j) {
+                      if (bdict->entries[i]->matches[j] != NULL) {
+                          free(bdict->entries[i]->matches[j]);
+                      }
+                  }
+                  free(bdict->entries[i]->bipartition);
+                  free(bdict->entries[i]->matches);
+                  free(bdict->entries[i]->td);
+                  free(bdict->entries[i]);
+              }
+          }
+          free(bdict->entries);
+      }
+    }
+    free(bdictarray->bdict);
+    free(bdictarray);
+}
+
+
+void after_tbe_support(BipartitionSupportArray* bsupp_arr){
+    if (bsupp_arr == NULL) {
+        fprintf(stderr, "BipartitionDict is NULL, nothing to free.\n");
+        return;
+    }
+
+    fprintf(stderr, "Freeing Bipartition Support Array memory: %p\n", bsupp_arr);
+
+    for (int i=0; i<bsupp_arr->num_entries; i++){
+      BipartitionSupport* bsupp = bsupp_arr->bipartition_supports[i];
+      free(bsupp->bipartition);
+      free(bsupp);
+    }
+    free(bsupp_arr->bipartition_supports);
+    free(bsupp_arr);
+
+}
+
+
+
+void print_bdict(BipartitionDict* bdict){
+  int n_entries = bdict->num_entries;
+  fprintf(stderr, "n_entries: %d\n", n_entries);
+  for (int i=0; i<n_entries; i++){
+    BipartitionMatches* match = bdict->entries[i];
+    if (match->is_external) continue;
+    fprintf(stderr, "printing entries... of entry %d / %d\n", i, n_entries);
+    // fprintf(stderr, "%d\n", match->num_matches);
+    // fprintf(stderr, "freed entries\n");
+    print_bitvector(bdict->entries[i]->bipartition, bdict->n_taxa);
+    // fprintf(stderr, "freed bipartition\n");
+    // fprintf(stderr, "freed matches\n");
+    fprintf(stderr, "transfer dists: ");
+    for (int j=0; j< bdict->num_matches; ++j )  fprintf(stderr, "%u ", bdict->entries[i]->td[j]);
+    fprintf(stderr, "\n");
+
+    for (int j=0; j<bdict->num_matches; ++j){
+      fprintf(stderr, "match%d: ", j);
+      print_bitvector(bdict->entries[i]->matches[j], bdict->n_taxa);
+    }
+    // fprintf(stderr, "freed td\n");
+    // fprintf(stderr, "freed entry\n");
+  }
+}
+
+/*
+Compute the Transfer Index for all edges, comparing a reference tree to an
+alternative (bootstrap) tree.
+
+transfer_index[i] will have the transfer index for edge i.
+*/
+void compute_transfer_indices(Tree *ref_tree, const int n, const int m,
+                              Tree *alt_tree, int *transfer_index,
+                              const int max_branches_boot,
+                              double *moved_species_counts,
+                              int **moved_species_counts_per_branch,
+                              int count_per_branch, const double dist_cutoff){
+  
+  short unsigned** c_matrix;     //matrix of cardinals of complements
+  short unsigned** i_matrix;     //matrix of cardinals of intersections
+  short unsigned** hamming;      //matrix of Hamming distances
+  short unsigned* min_dist_edge; //edge ids corresponding to min Hamming dists
+  short unsigned* min_dist;      //edge ids corresponding to min Hamming dists
+  int *moved_species; /* array of number of branches in which each taxon moves, in one bootstrap tree: initialized at each bootstrap tree */
+  moved_species = (int*) calloc(n,sizeof(int));
+
+  /* resetting the arrays that need be reset. By construction of the post-order traversal,
+     the other arrays (i_matrix, c_matrix and hamming) need not be reset. */
+  reset_matrices(n, m, max_branches_boot, &c_matrix, &i_matrix, &hamming, &min_dist,&min_dist_edge);
+
+  /****************************************************/
+  /* comparison of the bipartitions, Transfer method */
+  /****************************************************/		  
+  /* calculation of the C and I matrices (see Brehelin/Gascuel/Martin) */
+  update_all_i_c_post_order_ref_tree(ref_tree, alt_tree, i_matrix, c_matrix);
+  update_all_i_c_post_order_boot_tree(ref_tree, alt_tree, i_matrix, c_matrix, hamming, min_dist, min_dist_edge);
+
+  /* Looking at number of times each taxon moves around low distance branches */
+  int nb_branches_close=0;
+  int i, j;
+  for(i=0;i<m;i++){
+    Edge* re = ref_tree->a_edges[i];
+    if (re->right->nneigh == 1) continue;
+    Edge* be = alt_tree->a_edges[min_dist_edge[i]];
+
+    double norm  = ((double)min_dist[i]) * 1.0 / (((double)re->topo_depth) - 1.0);
+    int mindepth = (int)(ceil(1.0/dist_cutoff + 1.0));
+    int* sm = species_to_move(re, be, min_dist[i], n);
+    for(j=0;j<min_dist[i];j++){
+      if (norm <= dist_cutoff && re->topo_depth >= mindepth ){
+        moved_species[sm[j]]++;
+      }
+      if(moved_species_counts_per_branch != NULL && count_per_branch){
+        #pragma omp atomic update
+        moved_species_counts_per_branch[i][sm[j]]++;
+      }
+    }
+    if (norm <= dist_cutoff && re->topo_depth >= mindepth ){
+      nb_branches_close++;
+      }
+    free(sm);
+  }
+
+  for (i = 0; i < m; i++) {          //Record the transfer index for each edge.
+    transfer_index[i] = min_dist[i];
+  }
+  for (i=0; i < n; i++){
+    #pragma omp atomic update
+    moved_species_counts[i] += ((double)moved_species[i])*1.0/((double)nb_branches_close);
+  }
+
+  free_matrices(m, &c_matrix, &i_matrix, &hamming, &min_dist,&min_dist_edge);
+  free(moved_species);
+}
+
+// Returns the list of id of species to move to go from one branch to the other
+// Its length should correspond to given dist
+// If not, exit with an error
+int* species_to_move(Edge* re, Edge* be, int dist, int nb_taxa) {
+  int i;
+  int maxnb = dist;
+  if(nb_taxa-dist >= dist) maxnb=nb_taxa-dist;
+  int *diff = calloc(maxnb,sizeof(int));
+  int *equ  = calloc(maxnb,sizeof(int));
+  int nbdiff=0, nbequ=0;
+
+  for(i = 0; i < nb_taxa; i++) {
+    if(lookup_id(re->hashtbl,i) != lookup_id(be->hashtbl,i)){
+      diff[nbdiff]=i;
+      nbdiff++;
+    } else {
+      equ[nbequ] = i;
+      nbequ++;
+    }
+  }
+  if(nbdiff < nbequ){
+    if(nbdiff != dist){
+      fprintf(stderr,"Length of moved species array (%d) is not equal to the minimum distance found (%d)\n", nbdiff, dist);
+      Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+    }
+    free(equ);
+    return diff;
+  }
+  if(nbequ != dist){
+      fprintf(stderr,"Length of moved species array (%d) is not equal to the minimum distance found (%d)\n", nbequ, dist);
+      Generic_Exit(__FILE__,__LINE__,__FUNCTION__,EXIT_FAILURE);
+    }
+  free(diff);
+  return equ;
+}
