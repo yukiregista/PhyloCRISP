@@ -1,35 +1,44 @@
-# <img width="35" alt="logo" src="https://github.com/user-attachments/assets/b05ea043-676b-406d-a2be-8cc45c9cc315"/> PhyloCRISP: Phylogenetic Consensus Resolution via Improved Split Proximity
+# <img width="35" alt="logo" src="images/logo.png"/> PhyloCRISP: Phylogenetic Consensus Resolution via Improved Split Proximity
 
-PhyloCRISP is a software package for constructing more resolved, meaningful consensus trees from a set of phylogenetic trees than the conventional majority-rule trees. It implements methods proposed in the paper
+<p align="center">
+  <img src="images/mammals_consensus.png" width="92%" alt="Figure 5 consensus comparison on mammals phylogeny: majority-rule and unscaled transfer" />
+</p>
+<p align="center"><em>Consensus trees on the mammals bootstrap dataset (Figure 5).</em></p>
 
-> Yuki Takazawa, Atsushi Takeda, Momoko Hayamizu, and Olivier Gascuel. **Outperforming the Majority-Rule Consensus Tree Using Fine-Grained Dissimilarity Measures**, _submitted_.
+PhyloCRISP is a software package for constructing more resolved, meaningful consensus trees from a set of phylogenetic trees than the conventional majority-rule trees.
+This repository provides the official software implementation for:
+
+Yuki Takazawa, Atsushi Takeda, Momoko Hayamizu, and Olivier Gascuel. **Outperforming the Majority-Rule Consensus Tree Using Fine-Grained Dissimilarity Measures**, _submitted_.
+
+> **Abstract.** Phylogenetic analyses often require the summarization of multiple trees, e.g., in Bayesian analyses to obtain the centroid of the posterior distribution of trees, or to determine the consensus of a set of bootstrap trees. The majority-rule consensus tree is the most commonly used. It is easy to compute and minimizes the sum of Robinson-Foulds (RF) distances to the input trees. In mathematical terms, the majority-rule consensus tree is the median of the input trees with respect to the RF distance. However, due to the coarse nature of RF distance, which only considers whether two branches induce exactly the same bipartition of the taxa or not, highly unresolved trees can be produced when the phylogenetic signal is low. To overcome this limitation, we propose using median trees with respect to finer-grained dissimilarity measures between trees. These measures include a quartet distance between tree topologies, and transfer distances, which quantify the similarity between bipartitions, in contrast to the 0/1 view of RF. We describe fast heuristic consensus algorithms for transfer-based tree dissimilarities, capable of efficiently processing trees with thousands of taxa. Through evaluations on simulated datasets in both Bayesian and bootstrapping maximum-likelihood frameworks, our results show that our methods improve consensus tree resolution in scenarios with low to moderate phylogenetic signal, while providing better or comparable dissimilarities to the true phylogeny. Applying our methods to Mammal phylogeny and a large HIV dataset of over nine thousand taxa confirms the improvement with real data. These results demonstrate the usefulness of our new consensus tree methods for analyzing the large datasets that are available today. Our software,
+> 33 PhyloCRISP, is available from https://github.com/yukiregista/PhyloCRISP.
 
 The software supports both a graphical user interface (GUI) and a command-line interface (CLI), as demonstrated in the following tutorial.
 
 <!-- While the entire datasets analyzed in the paper is available at DRYAD, some of the data are also found in `example_data` for the tutorial purpose.  -->
 
-Some of the data can be found in `example_data` for the tutorial purpose.
+Some tutorial input data are available in `example_data/`.
+For manuscript datasets and external source links, see [`data/`](data/) and [`data/README.md`](data/README.md).
 
 ## Install (GUI)
 
 You can download and install the GUI version of PhyloCRISP for Windows, macOS, and Linux:
 
-- [Windows](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-Setup-0.0.1-win-x64.exe)
-- [Mac](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.1-macos.dmg)
-- [Linux](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.1-linux-x64.AppImage)
+- [Windows (x64)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-Setup-0.0.1-win-x64.exe)
+- [Mac (Apple Silicon)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.1-macos.dmg)
+- [Linux (x64)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.1-linux-x64.AppImage)
 
 ## Tutorial (GUI)
 
-This tutorial demonstrates how to reproduce the consensus tree from the **mammals dataset** (Figure 6 in the paper). We also illustrate how to compare it with the majority rule consensus tree.
+This tutorial walks through the GUI workflow for generating consensus trees using an example primate clade dataset (a subset of the mammals dataset used in the paper).
 
 ### Step 1: Prepare Input Files
 
-You will need the following two files from the Mammals dataset:
+You will need the following two files from this tutorial dataset.
+They are included in this repository under `example_data/primates/`:
 
-- [bootstrap_trees_full.standardized.nw](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/bootstrap_trees_full.standardized.nw) — the set of bootstrap trees (input trees, ~30 MB)
-- [reference_tree.standardized.nw](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/reference_tree.standardized.nw) — the reference tree used as the starting tree (~90 KB)
-
-<!-- These files are also available at DRYAD. -->
+- [`example_data/primates/bootstrap_trees_primates.standardized.nw`](example_data/primates/bootstrap_trees_primates.standardized.nw) — the set of 100 bootstrap trees (input trees, ~436 KB)
+- [`example_data/primates/reference_tree_primates.standardized.nw`](example_data/primates/reference_tree_primates.standardized.nw) — the reference tree used as the starting tree (~12 KB)
 
 ### Step 2: Launch the Application
 
@@ -37,32 +46,34 @@ Run the GUI application.
 
 On macOS and Windows, you may see security warnings when running software from outside the official app store or package manager. On macOS, allow the app to run via **System Settings → Privacy & Security** ([Apple support](https://support.apple.com/guide/mac-help/open-a-mac-app-from-an-unknown-developer-mh40616/mac)). On Windows, click **More info → Run anyway** in the SmartScreen warning ([Microsoft SmartScreen overview](https://learn.microsoft.com/en-us/windows/security/operating-system-security/virus-and-threat-protection/microsoft-defender-smartscreen)).
 
+On Linux, if the AppImage does not open, right-click the file, go to **Properties → Permissions**, and enable **Allow executing file as program**.
+
 ### Step 3: Configure the Settings
 
 In the GUI, configure the following options as shown in the screenshot below:
 
-1. **Input Trees**: Click _Browse Input Trees File_ and select `bootstrap_trees_full.standardized.nw`.
+1. **Input Trees**: Click _Browse Input Trees File_ and select `bootstrap_trees_primates.standardized.nw`.
 2. **Consensus Method**: Here we select **Unscaled Transfer** from the dropdown menu to measure the dissimilarity between trees using this type of distance.
-3. **Optimization Strategy**: Here we select **Prune Only** for computing a median tree, which requires us specify an initial tree in the next step.
-4. **Starting Tree**: Click _Browse Starting Tree File_ and select `reference_tree.standardized.nw` as an initial tree. _(This option is required when using Prune Only.)_
-5. **Output Filename**: Set to a name of your choice. We also recommend tick the checkbox "Auto-save output".
+3. **Optimization Strategy**: Here we select **Prune Only** to compute a median tree, which requires specifying an initial tree in the next step.
+4. **Starting Tree**: Click _Browse Starting Tree File_ and select `reference_tree_primates.standardized.nw` as an initial tree. _(This option is required when using Prune Only.)_
+5. **Output Filename**: Set a name of your choice. We also recommend ticking the checkbox **Auto-save output**.
 6. **Output Directory**: Choose your desired output directory.
 
-<img width="605" height="1064" alt="image" src="https://github.com/user-attachments/assets/115e8d4e-5939-464f-b9c8-1185770c2253" />
+<img width="605" alt="image" src="images/tutorial_GUI_.png" />
 
 ### Step 4: Run and Save
 
-Click the **Generate Consensus Tree** button to start the computation. For this dataset, the computation is expected to end within 10 minutes. Once complete, the consensus tree will be displayed in the _Consensus Tree_ panel at the bottom, and the Newick file (.nwk), together with the transfer support values (.nwk.tsupp) and the frequency values (.nwk.fsupp), will be saved in your specified directly. (If you forgot to tick "Auto-save output", you can still save the result to your specified output directory by clicking the **Save Output** button.
+Click **Generate Consensus Tree** to start the computation. For this example dataset, computation typically finishes within a minute (depending on your machine). Once complete, the consensus tree is displayed in the _Consensus Tree_ panel at the bottom, and the Newick file (`.nwk`), together with transfer support values (`.nwk.tsupp`) and frequency values (`.nwk.fsupp`), is saved to your specified directory. If you did not enable **Auto-save output**, you can still save the result by clicking **Save Output**.
 
-### Step 5: Visualization of the Consensus Tree
+### Step 5: Visualize the Consensus Tree
 
-You can visualize the consensus tree using your preferred phylogenetic tool. You can easily reproduce the image in Figure 6(b) of the paper by uploading the newick file to [ITOL v7](https://itol.embl.de/).
+You can visualize the consensus tree using your preferred phylogenetic tool. For example, you can upload the Newick file to [ITOL v7](https://itol.embl.de/).
 
-<img width="1302" height="957" alt="image" src="https://github.com/user-attachments/assets/36a37c7c-7f68-4b03-9fee-730f16016786" />
+<img width="1302" alt="image" src="images/tutorial_itol_.png" />
 
-### Step 6: Comparison against the Majority Rule Consensus Tree
+### Step 6: Compare with the Majority-Rule Consensus Tree
 
-You can easily compare this consensus tree with the majority rule consensus tree. To get the majority rule tree for the same dataset, select **Majority Rule** from the dropdown menu for Consensus Methods in Step 3. You can reproduce Figure 6(a) of the paper by visualizing the output Newick file with [ITOL v7](https://itol.embl.de/).
+You can compare this consensus tree with a majority-rule consensus tree from the same example dataset. To generate the majority-rule tree, select **Majority Rule** from the dropdown menu for Consensus Methods in Step 3, then visualize the output Newick file in your preferred viewer (e.g., [ITOL v7](https://itol.embl.de/)).
 
 ## Install (CLI)
 
