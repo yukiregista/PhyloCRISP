@@ -24,9 +24,13 @@ For manuscript datasets and external source links, see [`data/`](data/) and [`da
 
 You can download and install the GUI version of PhyloCRISP for Windows, macOS, and Linux:
 
-- [Windows (x64)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-Setup-0.0.1-win-x64.exe)
-- [Mac (Apple Silicon)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.1-macos.dmg)
-- [Linux (x64)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.1-linux-x64.AppImage)
+- [Windows Installer (x64)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-Setup-0.0.2-win-x64.exe)
+- [Windows Portable (zip)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.2-win-x64-portable.zip)
+- [Mac (Apple Silicon)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.2-macos.dmg)
+- [Linux (x64, AppImage)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.2-linux-x64.AppImage)
+- [Linux (x64, tar.gz)](https://github.com/yukiregista/PhyloCRISP/releases/latest/download/PhyloCRISP-0.0.2-linux-x64.tar.gz)
+
+The Windows portable zip is provided as a fallback option if the installer is blocked by antivirus/SmartScreen on some environments.
 
 ## Tutorial (GUI)
 

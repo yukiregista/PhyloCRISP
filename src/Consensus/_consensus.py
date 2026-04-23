@@ -565,6 +565,10 @@ class Tree_with_support(dendropy.Tree):
         srp = std_risk_prune(self_copy, treelist, normalized)
         srp.greedy_pruning()
         return srp.current_tree
+
+    # Backward-compatible alias used by legacy tests/callers.
+    def std_greedy(self, treelist, normalized=True):
+        return self.STD_greedy_pruning(treelist=treelist, normalized=normalized)
     
     def SQD_greedy_pruning(self, treelist, parent_dir=None):
         """Apply greedy pruning algorithm w.r.t. SQD loss.
@@ -1308,6 +1312,10 @@ class TreeList_with_support(dendropy.TreeList):
         branch_support = dict(zip(bipar_ints, bipar_bs))
         # majority_tree.branch_support = branch_support
         return Tree_with_support(majority_tree, branch_support = branch_support, taxon_namespace = self.taxon_namespace)
+
+    # Backward-compatible alias used by legacy callers/tests.
+    def majority_consensus(self):
+        return self.majority_rule_consensus()
 
     def MCC(self):
         """Computes Maximum Clade Credibility (MCC) tree.

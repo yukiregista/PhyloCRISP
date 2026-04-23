@@ -170,8 +170,6 @@ memo.mdB
 .vscode/
 
 
-
-
 ## slurm/valgrind/massif
 slurm*
 massif*
@@ -180,6 +178,7 @@ scripts/*
 !scripts/build_booster_windows_cross_macos.sh
 !scripts/build_booster_windows_msys2.sh
 !scripts/build_windows_installer.ps1
+!scripts/build_windows_portable_zip.ps1
 !scripts/make_macos_icns.sh
 !scripts/make_windows_ico.py
 
@@ -198,3 +197,4 @@ scripts/*
 
 # zipped files
 *.zip
+!dist/installer/PhyloCRISP-*-win-x64-portable.zip

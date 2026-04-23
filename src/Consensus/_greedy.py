@@ -5,6 +5,7 @@ from itertools import combinations
 import distance
 from collections import OrderedDict
 import dendropy
+import warnings
 
 def _create_refinfo_splitkey(bipartitions, n_taxa):
     """Helper function for TBE
@@ -89,6 +90,87 @@ class GreedyConsensusBase():
         
         Bipartition2Index = {BipartitionList[i]:i for i in range(len(BipartitionList))}
         return np.array(BipartitionList), np.array(BipartitionCounts), BipartitionBitsList, np.array(BipartitionP), Bipartition2Index, BipartitionDict
+
+    def _append_missing_candidate_bipartitions(self, missing_bipar_keys):
+        """Append missing candidate bipartitions with batched array updates.
+
+        Returns
+        -------
+        np.ndarray
+            Indices of newly added bipartitions in the updated candidate arrays.
+        """
+        if not missing_bipar_keys:
+            return np.array([], dtype=int)
+
+        unique_missing = []
+        seen = set()
+        for key in missing_bipar_keys:
+            if key in self.Bipartition2Index or key in seen:
+                continue
+            seen.add(key)
+            unique_missing.append(key)
+
+        if not unique_missing:
+            return np.array([], dtype=int)
+
+        old_n = self.n_bipartitions
+        tree_leafset_bitmask = 2**self.n_taxa - 1
+
+        new_bits = []
+        new_p = []
+        for key in unique_missing:
+            bitstr = Bits(uint=key, length=self.n_taxa)
+            new_bits.append(bitstr)
+            new_p.append(min(bitstr.count(0), bitstr.count(1)))
+
+        list_dtype = self.BipartitionList.dtype if self.BipartitionList.size else np.int64
+        counts_dtype = self.BipartitionCounts.dtype if self.BipartitionCounts.size else np.int64
+        p_dtype = self.BipartitionP.dtype if self.BipartitionP.size else np.int64
+
+        self.BipartitionList = np.concatenate(
+            (self.BipartitionList, np.asarray(unique_missing, dtype=list_dtype))
+        )
+        self.BipartitionCounts = np.concatenate(
+            (self.BipartitionCounts, np.zeros(len(unique_missing), dtype=counts_dtype))
+        )
+        self.BipartitionP = np.concatenate(
+            (self.BipartitionP, np.asarray(new_p, dtype=p_dtype))
+        )
+        self.BipartitionBitsList.extend(new_bits)
+
+        for offset, key in enumerate(unique_missing):
+            new_index = old_n + offset
+            self.Bipartition2Index[key] = new_index
+            self.BipartitionDict.setdefault(
+                key,
+                dendropy.Bipartition(leafset_bitmask=key, tree_leafset_bitmask=tree_leafset_bitmask),
+            )
+
+        self.n_bipartitions = len(self.BipartitionList)
+        return np.arange(old_n, self.n_bipartitions, dtype=int)
+
+    def _extend_dist_for_new_bipartitions(self, new_indices):
+        """Incrementally extend DIST for new candidate bipartitions only."""
+        if len(new_indices) == 0:
+            return
+
+        old_n = int(new_indices[0])
+        new_n = self.n_bipartitions
+        old_dist = self.DIST
+        new_dist = np.zeros((new_n + 1, new_n + 1), dtype=old_dist.dtype)
+        new_dist[:old_n, :old_n] = old_dist[:old_n, :old_n]
+
+        for i in range(old_n, new_n):
+            bit_i = self.BipartitionBitsList[i]
+            for j in range(i):
+                bit_j = self.BipartitionBitsList[j]
+                d_ij = _MinHammingDist(bit_i, bit_j)
+                new_dist[i, j] = d_ij
+                new_dist[j, i] = d_ij
+
+        new_dist[new_n, :new_n] = self.BipartitionP - 1
+        new_dist[:new_n, new_n] = self.BipartitionP - 1
+        self.DIST = new_dist
     
     def __init__(self, input_trees : TreeList_with_support):
         self.input_trees = input_trees
@@ -219,6 +301,19 @@ class STDGreedyConsensus(GreedyConsensusBase):
                 minDist = np.min(self.DIST[bipar, indices])
                 TD[bipar] += min (minDist / (self.BipartitionP[bipar]-1), 1)
         return TD
+
+    def _append_transfer_dissimilarity_cost(self, new_indices):
+        if len(new_indices) == 0:
+            return
+        start = int(new_indices[0])
+        new_td = np.zeros(self.n_bipartitions - start, dtype=self.TD.dtype)
+        for tree in self.input_trees:
+            internal_bipartitions = [item.bipartition.split_as_int() for item in tree.internal_edges(exclude_seed_edge=True)]
+            indices = [self.Bipartition2Index[item] for item in internal_bipartitions]
+            for i, bipar in enumerate(range(start, self.n_bipartitions)):
+                minDist = np.min(self.DIST[bipar, indices])
+                new_td[i] += min(minDist / (self.BipartitionP[bipar] - 1), 1)
+        self.TD = np.concatenate((self.TD, new_td))
             
     
     def __init__(self, input_trees : TreeList_with_support):
@@ -235,12 +330,26 @@ class STDGreedyConsensus(GreedyConsensusBase):
         # self.n_bipartitions is used to represent the match with leaf bipartitions.
         
     def specify_initial_tree(self, initial_tree : Tree_with_support, *args, **kwargs):
-        # initial tree should only have those bipartitions in the input trees
         assert (initial_tree.taxon_namespace == self.taxon_namespace)
         internal_branches = initial_tree.internal_edges(exclude_seed_edge = True)
         internal_bipar_keys = [item.bipartition.split_as_int() for item in internal_branches]
-        if not np.all([item in self.BipartitionList for item in internal_bipar_keys]):
-            raise ValueError("Initial tree should only have bipartitions present in the input trees.")
+        missing_bipar_keys = [item for item in internal_bipar_keys if item not in self.Bipartition2Index]
+        if missing_bipar_keys:
+            unique_missing = []
+            seen = set()
+            for key in missing_bipar_keys:
+                if key in self.Bipartition2Index or key in seen:
+                    continue
+                seen.add(key)
+                unique_missing.append(key)
+            warnings.warn(
+                f"{len(unique_missing)} bipartition(s) from the starting tree are not present in input trees; "
+                "adding them to candidate bipartitions.",
+                UserWarning,
+            )
+            new_indices = self._append_missing_candidate_bipartitions(unique_missing)
+            self._extend_dist_for_new_bipartitions(new_indices)
+            self._append_transfer_dissimilarity_cost(new_indices)
         
         # renew self.current_tree_included
         self.current_tree_included = np.zeros(self.n_bipartitions)
@@ -602,6 +711,19 @@ class SUTDGreedyConsensus(GreedyConsensusBase):
                 minDist = np.min(self.DIST[bipar, indices])
                 TD[bipar] += min (minDist, self.BipartitionP[bipar]-1)
         return TD
+
+    def _append_unnormalized_transfer_dissimilarity_cost(self, new_indices):
+        if len(new_indices) == 0:
+            return
+        start = int(new_indices[0])
+        new_utd = np.zeros(self.n_bipartitions - start, dtype=self.UTD.dtype)
+        for tree in self.input_trees:
+            internal_bipartitions = [item.bipartition.split_as_int() for item in tree.internal_edges(exclude_seed_edge=True)]
+            indices = [self.Bipartition2Index[item] for item in internal_bipartitions]
+            for i, bipar in enumerate(range(start, self.n_bipartitions)):
+                minDist = np.min(self.DIST[bipar, indices])
+                new_utd[i] += min(minDist, self.BipartitionP[bipar] - 1)
+        self.UTD = np.concatenate((self.UTD, new_utd))
     
     def __init__(self, input_trees : TreeList_with_support):
         super().__init__(input_trees)
@@ -617,12 +739,26 @@ class SUTDGreedyConsensus(GreedyConsensusBase):
         # self.n_bipartitions is used to represent the match with leaf bipartitions.
         
     def specify_initial_tree(self, initial_tree : Tree_with_support, *args, **kwargs):
-        # initial tree should only have those bipartitions in the input trees
         assert (initial_tree.taxon_namespace == self.taxon_namespace)
         internal_branches = initial_tree.internal_edges(exclude_seed_edge = True)
         internal_bipar_keys = [item.bipartition.split_as_int() for item in internal_branches]
-        if not np.all([item in self.BipartitionList for item in internal_bipar_keys]):
-            raise ValueError("Initial tree should only have bipartitions present in the input trees.")
+        missing_bipar_keys = [item for item in internal_bipar_keys if item not in self.Bipartition2Index]
+        if missing_bipar_keys:
+            unique_missing = []
+            seen = set()
+            for key in missing_bipar_keys:
+                if key in self.Bipartition2Index or key in seen:
+                    continue
+                seen.add(key)
+                unique_missing.append(key)
+            warnings.warn(
+                f"{len(unique_missing)} bipartition(s) from the starting tree are not present in input trees; "
+                "adding them to candidate bipartitions.",
+                UserWarning,
+            )
+            new_indices = self._append_missing_candidate_bipartitions(unique_missing)
+            self._extend_dist_for_new_bipartitions(new_indices)
+            self._append_unnormalized_transfer_dissimilarity_cost(new_indices)
         
         # renew self.current_tree_included
         self.current_tree_included = np.zeros(self.n_bipartitions)

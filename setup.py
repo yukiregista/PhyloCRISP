@@ -99,6 +99,6 @@ else:
 
 setup(
     name="PhyloCRISP",
-    version="0.0.1",
+    version="0.0.2",
     ext_modules=ext_modules,  # Booster is optional on some platforms (e.g., Windows stage-0 install)
 )
