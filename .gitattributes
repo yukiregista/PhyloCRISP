@@ -1,4 +1,0 @@
-# Installer artifacts are distributed via GitHub Releases (not Git LFS).
-dist/installer/PhyloCRISP-0.0.2-linux-x64.AppImage filter=lfs diff=lfs merge=lfs -text
-dist/installer/PhyloCRISP-0.0.2-linux-x64.tar.gz filter=lfs diff=lfs merge=lfs -text
-dist/installer/* filter=lfs diff=lfs merge=lfs -text
