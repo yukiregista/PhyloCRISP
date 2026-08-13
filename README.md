@@ -102,6 +102,7 @@ pip install .
 cd src/booster/src
 make
 cd ../../..
+install -m 755 src/booster/src/booster "$(python -c 'import sysconfig; print(sysconfig.get_path("scripts"))')/booster"
 ```
 
 On macOS with Apple clang, install OpenMP first if needed:
