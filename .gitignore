@@ -198,3 +198,7 @@ scripts/*
 # zipped files
 *.zip
 !dist/installer/PhyloCRISP-*-win-x64-portable.zip
+
+# The public Python package contains bundled binaries and tree example data.
+!src/phylocrisp/
+!src/phylocrisp/**

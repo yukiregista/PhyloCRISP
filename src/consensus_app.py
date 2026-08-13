@@ -12,14 +12,14 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import QTimer, QThread, pyqtSignal, QStandardPaths
 from PyQt6.QtGui import QIcon
-import Consensus
-from Consensus._app_options import (
+import phylocrisp
+from phylocrisp._app_options import (
     default_output_filename,
     effective_strategy_token,
     method_token_from_gui_label,
 )
 
-_ = Consensus.__file__  # Ensure the Consensus package is imported
+_ = phylocrisp.__file__  # Ensure the phylocrisp package is imported
 
 APP_NAME = "PhyloCRISP"
 APP_ICON_RELATIVE_PATH = os.path.join("assets", "icons", "image1.png")
@@ -113,7 +113,7 @@ def _maybe_run_embedded_cli_mode():
         return
     idx = sys.argv.index(flag)
     cli_args = sys.argv[idx + 1:]
-    from Consensus.main import main as consensus_main
+    from phylocrisp.main import main as consensus_main
     try:
         consensus_main(cli_args)
         raise SystemExit(0)
@@ -130,7 +130,7 @@ def _build_consensus_command(args):
         # Re-enter this same executable in internal CLI mode.
         return [sys.executable, "--run-consensus-cli"] + args
     # Development mode: run the module directly from the current interpreter.
-    return [sys.executable, "-m", "Consensus.main"] + args
+    return [sys.executable, "-m", "phylocrisp.main"] + args
 
 
 def _cli_popen_window_kwargs():
@@ -225,6 +225,9 @@ class ConsensusApp(QMainWindow):
         self.input_trees_content = ""
         self.input_trees_filename = ""
         self.input_trees_file_path = ""
+        self.input_trees_content_loaded = False
+        self.input_trees_content_dirty = False
+        self._updating_input_text = False
         self.starting_tree_content = ""
         self.starting_tree_filename = ""
         self.starting_tree_file_path = ""
@@ -420,9 +423,34 @@ class ConsensusApp(QMainWindow):
 
     def on_input_text_changed(self):
         """Called when input text is edited."""
-        # Only update content if we're showing actual content (not filename)
-        if self.input_display_checkbox.isChecked():
+        if self.input_display_checkbox.isChecked() and not self._updating_input_text:
             self.input_trees_content = self.input_text.toPlainText()
+            self.input_trees_content_loaded = True
+            self.input_trees_content_dirty = True
+
+    def _set_input_text(self, text):
+        self._updating_input_text = True
+        try:
+            self.input_text.setPlainText(text)
+        finally:
+            self._updating_input_text = False
+
+    def _load_input_content_for_preview(self):
+        if self.input_trees_content_loaded:
+            return True
+        if not self.input_trees_file_path:
+            self.input_trees_content_loaded = True
+            return True
+        try:
+            with open(self.input_trees_file_path, "r") as input_file:
+                self.input_trees_content = input_file.read()
+            self.input_trees_content_loaded = True
+            self.input_trees_content_dirty = False
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load file preview: {str(e)}")
+            logging.error(f"Failed to load input preview: {str(e)}")
+            return False
 
     def on_starting_text_changed(self):
         """Called when starting tree text is edited."""
@@ -792,15 +820,18 @@ class ConsensusApp(QMainWindow):
     def toggle_input_display(self, checked):
         """Toggle between displaying content or filename for input trees."""
         if checked:
-            # Show content and make editable
-            self.input_text.setPlainText(self.input_trees_content)
+            if not self._load_input_content_for_preview():
+                self.input_display_checkbox.blockSignals(True)
+                self.input_display_checkbox.setChecked(False)
+                self.input_display_checkbox.blockSignals(False)
+                return
+            self._set_input_text(self.input_trees_content)
             self.input_text.setReadOnly(False)
         else:
-            # Show filename and make non-editable
             if self.input_trees_filename:
-                self.input_text.setPlainText(f"File loaded: {self.input_trees_filename}")
+                self._set_input_text(f"File selected: {self.input_trees_filename}")
             else:
-                self.input_text.setPlainText("No file loaded")
+                self._set_input_text("No file selected")
             self.input_text.setReadOnly(True)
 
     def toggle_starting_display(self, checked):
@@ -835,32 +866,18 @@ class ConsensusApp(QMainWindow):
         if file_path:
             try:
                 self._remember_browse_path(file_path)
-                # Get file size
                 file_size = os.path.getsize(file_path)
-                is_large_file = file_size > LARGE_FILE_THRESHOLD
-                
-                with open(file_path, "r") as file:
-                    self.input_trees_content = file.read()
-                    self.input_trees_filename = os.path.basename(file_path)
-                    self.input_trees_file_path = file_path
-                    
-                    # Update size label
-                    self.input_size_label.setText(f"({self.format_file_size(file_size)})")
-                    
-                    # Auto-hide large files
-                    if is_large_file:
-                        self.input_display_checkbox.setChecked(False)
-                        self.input_text.setPlainText(f"File loaded: {self.input_trees_filename} (Large file - content hidden)")
-                        self.input_text.setReadOnly(True)
-                    else:
-                        if self.input_display_checkbox.isChecked():
-                            self.input_text.setPlainText(self.input_trees_content)
-                            self.input_text.setReadOnly(False)
-                        else:
-                            self.input_text.setPlainText(f"File loaded: {self.input_trees_filename}")
-                            self.input_text.setReadOnly(True)
-                    self.refresh_output_filename_placeholder()
-                    logging.info(f"Loaded file: {file_path} ({self.format_file_size(file_size)})")
+                self.input_trees_content = ""
+                self.input_trees_content_loaded = False
+                self.input_trees_content_dirty = False
+                self.input_trees_filename = os.path.basename(file_path)
+                self.input_trees_file_path = file_path
+                self.input_size_label.setText(f"({self.format_file_size(file_size)})")
+                self.input_display_checkbox.setChecked(False)
+                self._set_input_text(f"File selected: {self.input_trees_filename}")
+                self.input_text.setReadOnly(True)
+                self.refresh_output_filename_placeholder()
+                logging.info(f"Selected input file: {file_path} ({self.format_file_size(file_size)})")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load file: {str(e)}")
                 logging.error(f"Failed to load file: {str(e)}")
@@ -975,14 +992,17 @@ class ConsensusApp(QMainWindow):
         QTimer.singleShot(3000, lambda: self.status_label.setVisible(False))
 
     def generate_consensus_tree(self):
-        # Use stored content instead of text area content
-        input_trees = self.input_trees_content
         method = self.method_combo.currentText()
         method_token = self._current_method_token()
         strategy = self._current_strategy_token()
         starting_tree = self.starting_tree_content
 
-        if not input_trees.strip():
+        use_original_input = bool(
+            self.input_trees_file_path
+            and os.path.isfile(self.input_trees_file_path)
+            and not self.input_trees_content_dirty
+        )
+        if not use_original_input and not self.input_trees_content.strip():
             QMessageBox.warning(self, "Error", "Input trees are required.")
             return
 
@@ -996,13 +1016,15 @@ class ConsensusApp(QMainWindow):
 
         # Create a persistent temporary directory
         self.temp_dir_path = tempfile.mkdtemp()
-        input_file = os.path.join(self.temp_dir_path, "input_trees.txt")
-        output_file = os.path.join(self.temp_dir_path, "output_consensus_tree")
+        input_file = self.input_trees_file_path if use_original_input else os.path.join(
+            self.temp_dir_path, "input_trees.txt"
+        )
         starting_tree_file = os.path.join(self.temp_dir_path, "starting_tree.txt")
 
         try:
-            with open(input_file, "w") as f:
-                f.write(input_trees)
+            if not use_original_input:
+                with open(input_file, "w") as f:
+                    f.write(self.input_trees_content)
 
             if starting_tree.strip():
                 with open(starting_tree_file, "w") as f:

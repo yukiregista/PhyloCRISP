@@ -156,7 +156,7 @@ def _require_tqdist_executable(executable_name):
     if executable_path is None:
         raise FileNotFoundError(
             f"Error: '{executable_name}' not found. Install tqDist on PATH or bundle it under "
-            f"'src/Consensus/bin/{_platform_folder()}/{_arch_folder()}'."
+            f"'src/phylocrisp/bin/{_platform_folder()}/{_arch_folder()}'."
         )
     return executable_path
 
@@ -236,6 +236,54 @@ def _quartet_resolution_str(tree_string, parent_dir = None, normalized=True):
         return (num_all_quartets - num_unresolved_quartets_agreed)/num_all_quartets
     else:
         return (num_all_quartets - num_unresolved_quartets_agreed)
+
+
+def _quartet_resolution_file(tree_path, parent_dir=None, normalized=True):
+    """Compute quartet resolution directly from a Newick file."""
+    quartet_dist_exe = _require_tqdist_executable("quartet_dist")
+    p = _run_subprocess_hidden(
+        [quartet_dist_exe, "-v", os.fspath(tree_path), os.fspath(tree_path)],
+        capture_output=True,
+        text=True,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.strip() or "quartet_dist failed")
+    items = [float(item) for item in p.stdout.split()]
+    if len(items) < 8:
+        raise RuntimeError("quartet_dist returned incomplete output")
+    num_all_quartets = items[1]
+    num_unresolved_quartets_agreed = np.array(items[6::8])
+    resolved = num_all_quartets - num_unresolved_quartets_agreed
+    if normalized:
+        return resolved / num_all_quartets
+    return resolved
+
+
+def _count_newick_trees(tree_path):
+    """Count line-oriented Newick records without loading the file."""
+    with open(tree_path, "r") as tree_file:
+        count = sum(1 for line in tree_file if line.strip())
+    if count == 0:
+        raise ValueError("Input tree file does not contain any Newick trees.")
+    return count
+
+
+def _newline_terminated_tree_path(tree_path, parent_dir=None):
+    """Return the original path, or a streaming copy with a final newline."""
+    with open(tree_path, "rb") as tree_file:
+        tree_file.seek(0, os.SEEK_END)
+        size = tree_file.tell()
+        if size == 0:
+            raise ValueError("Input tree file is empty.")
+        tree_file.seek(-1, os.SEEK_END)
+        if tree_file.read(1) in (b"\n", b"\r"):
+            return os.fspath(tree_path), None
+
+    normalized_path = _tmp_nwk_path(parent_dir)
+    with open(tree_path, "rb") as source, open(normalized_path, "wb") as destination:
+        shutil.copyfileobj(source, destination)
+        destination.write(b"\n")
+    return normalized_path, normalized_path
 
 
 def _tqdist_fp_fn(estimate, true, parent_dir = None):
@@ -319,6 +367,66 @@ def _tqdist_fp_fn_trees_str(estimate, input_trees_string, n_trees, parent_dir = 
     fn = unresolved_resolved_fn + resolved_resolved_disagree
     fp = resolved_unresolved_fp + resolved_resolved_disagree
     return fp, fn
+
+
+def _tqdist_fp_fn_trees_file(estimate, input_trees_path, parent_dir=None):
+    """Compute quartet FP/FN arrays while leaving input trees on disk."""
+    executable_path = _require_tqdist_executable("pairs_quartet_dist")
+    estimatename = _tmp_nwk_path(parent_dir)
+    tqdist_input_path, temporary_input_path = _newline_terminated_tree_path(
+        input_trees_path, parent_dir
+    )
+    n_trees = _count_newick_trees(tqdist_input_path)
+    estimate_string = estimate.as_string(schema="newick", suppress_rooting=True)
+    try:
+        with open(estimatename, "w") as estimate_file:
+            for _ in range(n_trees):
+                estimate_file.write(estimate_string)
+
+        p = _run_subprocess_hidden(
+            [executable_path, "-v", estimatename, tqdist_input_path],
+            capture_output=True,
+            text=True,
+        )
+        if p.returncode != 0:
+            raise RuntimeError(p.stderr.strip() or "pairs_quartet_dist failed")
+        items = [float(item) for item in p.stdout.split()]
+        if len(items) < 8:
+            raise RuntimeError("pairs_quartet_dist returned incomplete output")
+        num_unresolved_quartets_agreed = np.array(items[6::8])
+        num_resolved_quartets_agreed = np.array(items[4::8])
+        if len(num_unresolved_quartets_agreed) != n_trees:
+            raise RuntimeError(
+                f"Expected quartet results for {n_trees} trees, got {len(num_unresolved_quartets_agreed)}."
+            )
+
+        num_all_quartets = items[1]
+        estimate_num_resolved = _quartet_resolution(estimate, parent_dir=parent_dir, normalized=False)
+        estimate_num_unresolved = num_all_quartets - estimate_num_resolved
+        true_num_resolved = _quartet_resolution_file(
+            tqdist_input_path, parent_dir=parent_dir, normalized=False
+        )
+        true_num_unresolved = num_all_quartets - true_num_resolved
+
+        unresolved_resolved_fn = estimate_num_unresolved - num_unresolved_quartets_agreed
+        resolved_unresolved_fp = true_num_unresolved - num_unresolved_quartets_agreed
+        resolved_resolved_disagree = (
+            estimate_num_resolved - resolved_unresolved_fp - num_resolved_quartets_agreed
+        )
+        if not np.allclose(
+            resolved_resolved_disagree,
+            true_num_resolved - unresolved_resolved_fn - num_resolved_quartets_agreed,
+        ):
+            raise RuntimeError("Inconsistent quartet-distance components returned by tqdist.")
+        return (
+            resolved_unresolved_fp + resolved_resolved_disagree,
+            unresolved_resolved_fn + resolved_resolved_disagree,
+        )
+    finally:
+        if os.path.exists(estimatename):
+            os.remove(estimatename)
+        if temporary_input_path and os.path.exists(temporary_input_path):
+            os.remove(temporary_input_path)
      
 
 def SQD_loss(consensus_tree, input_trees_string, n_trees, normalized=True, parent_dir = None):
@@ -327,6 +435,14 @@ def SQD_loss(consensus_tree, input_trees_string, n_trees, normalized=True, paren
     loss = np.sum(fp+fn)
     if normalized:
         loss = loss/n_trees
+    return loss
+
+
+def SQD_loss_file(consensus_tree, input_trees_path, normalized=True, parent_dir=None):
+    fp, fn = _tqdist_fp_fn_trees_file(consensus_tree, input_trees_path, parent_dir)
+    loss = np.sum(fp + fn)
+    if normalized:
+        loss = loss / len(fp)
     return loss
 
 def SQD_pruning(consensus_tree, input_trees, parent_dir=None):
@@ -375,6 +491,60 @@ def SQD_pruning(consensus_tree, input_trees, parent_dir=None):
         current_loss = current_loss - max_value
         loss_reduction_dict.pop(max_key)
         ed = time.time()
+        reduction_list.append(max_value)
+    return consensus_tree, reduction_list
+
+
+def SQD_pruning_file(consensus_tree, input_trees_path, parent_dir=None):
+    """Apply quartet pruning without constructing a Python tree list."""
+    bipartitions = np.array(consensus_tree.encode_bipartitions())
+    bipartition_ints = np.array([bipartition.split_as_int() for bipartition in bipartitions])
+    internal_edges = consensus_tree.internal_edges(exclude_seed_edge=True)
+    internal_bipartition_ints = np.array(
+        [edge.bipartition.split_as_int() for edge in internal_edges]
+    )
+    internal_edge_dict = {edge.bipartition.split_as_int(): edge for edge in internal_edges}
+    taxon_namespace = consensus_tree.taxon_namespace
+    current_loss = SQD_loss_file(consensus_tree, input_trees_path, False, parent_dir)
+    next_updates = internal_bipartition_ints
+    loss_reduction_dict = {bipar_int: 0 for bipar_int in internal_bipartition_ints}
+    reduction_list = []
+
+    while loss_reduction_dict:
+        for bipar_int in next_updates:
+            if bipar_int in internal_bipartition_ints:
+                mask = bipar_int != bipartition_ints
+                pruned_tree = dendropy.Tree.from_bipartition_encoding(
+                    bipartitions[mask], taxon_namespace=taxon_namespace
+                )
+                loss = SQD_loss_file(pruned_tree, input_trees_path, False, parent_dir)
+                loss_reduction_dict[bipar_int] = current_loss - loss
+
+        max_key = max(loss_reduction_dict, key=loss_reduction_dict.get)
+        max_value = loss_reduction_dict[max_key]
+        if max_value <= 0:
+            break
+
+        next_updates = [
+            edge.bipartition.split_as_int()
+            for edge in internal_edge_dict[max_key].adjacent_edges
+        ]
+        consensus_tree = dendropy.Tree.from_bipartition_encoding(
+            bipartitions[max_key != bipartition_ints], taxon_namespace=taxon_namespace
+        )
+        bipartitions = np.array(consensus_tree.encode_bipartitions())
+        bipartition_ints = np.array(
+            [bipartition.split_as_int() for bipartition in bipartitions]
+        )
+        internal_edges = consensus_tree.internal_edges(exclude_seed_edge=True)
+        internal_bipartition_ints = np.array(
+            [edge.bipartition.split_as_int() for edge in internal_edges]
+        )
+        internal_edge_dict = {
+            edge.bipartition.split_as_int(): edge for edge in internal_edges
+        }
+        current_loss -= max_value
+        loss_reduction_dict.pop(max_key)
         reduction_list.append(max_value)
     return consensus_tree, reduction_list
 
@@ -585,6 +755,12 @@ class Tree_with_support(dendropy.Tree):
         """
         self_copy = self.clone(depth=1)
         res, reduction_list = SQD_pruning(self_copy, treelist, parent_dir)
+        return res
+
+    def SQD_greedy_pruning_file(self, input_trees_path, parent_dir=None):
+        """Apply SQD greedy pruning directly against a Newick file."""
+        self_copy = self.clone(depth=1)
+        res, reduction_list = SQD_pruning_file(self_copy, input_trees_path, parent_dir)
         return res
     
     def BS_prune(self, treelist, threshold=0.5):

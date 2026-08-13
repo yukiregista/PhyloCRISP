@@ -208,7 +208,7 @@ def _read_support_tree_to_map(support_tree_file, taxon_namespace):
     return support_map
 
 
-def _compute_support_maps_with_booster(consensus_tree, input_trees):
+def _compute_support_maps_with_booster(consensus_tree, input_trees=None, input_trees_path=None):
     support_maps = {}
     errors = []
     try:
@@ -218,15 +218,16 @@ def _compute_support_maps_with_booster(consensus_tree, input_trees):
 
     with tempfile.TemporaryDirectory(prefix="consensus_booster_") as tmpdir:
         reference_tree_file = os.path.join(tmpdir, "reference.nwk")
-        bootstrap_trees_file = os.path.join(tmpdir, "bootstrap_trees.nwk")
+        bootstrap_trees_file = input_trees_path or os.path.join(tmpdir, "bootstrap_trees.nwk")
         fbp_tree_file = os.path.join(tmpdir, "fbp_output.nwk")
         tbe_tree_file = os.path.join(tmpdir, "tbe_output.nwk")
 
         with open(reference_tree_file, "w") as f:
             f.write(_plain_newick_string(consensus_tree) + "\n")
-        with open(bootstrap_trees_file, "w") as f:
-            for tree in input_trees:
-                f.write(_plain_newick_string(tree) + "\n")
+        if input_trees_path is None:
+            with open(bootstrap_trees_file, "w") as f:
+                for tree in input_trees:
+                    f.write(_plain_newick_string(tree) + "\n")
 
         try:
             _run_booster_cli(booster_executable, "fbp", reference_tree_file, bootstrap_trees_file, fbp_tree_file)
@@ -243,9 +244,13 @@ def _compute_support_maps_with_booster(consensus_tree, input_trees):
     return support_maps, errors
 
 
-def _write_all_outputs(consensus_tree, input_trees, output_file):
+def _write_all_outputs(consensus_tree, output_file, input_trees=None, input_trees_path=None):
     _write_plain_newick(consensus_tree, output_file)
-    support_maps, errors = _compute_support_maps_with_booster(consensus_tree, input_trees)
+    support_maps, errors = _compute_support_maps_with_booster(
+        consensus_tree,
+        input_trees=input_trees,
+        input_trees_path=input_trees_path,
+    )
     support_outputs = []
 
     if "fsupp" in support_maps:
@@ -362,14 +367,14 @@ def main(args=None):
     if method_token == "quartet" and strategy_token != "prune":
         raise ConsensusError("Method 'quartet' currently supports prune-only mode only.")
 
-    try:
-        input_trees = TreeList_with_support.get(path=args.input_trees, schema="newick")
-    except Exception as e:
-        raise ConsensusError(f"Error in reading input trees (Newick expected): {e}")
-
+    input_trees = None
     consensus_tree = None
 
     if method_token == "mr":
+        try:
+            input_trees = TreeList_with_support.get(path=args.input_trees, schema="newick")
+        except Exception as e:
+            raise ConsensusError(f"Error in reading input trees (Newick expected): {e}")
         consensus_tree = input_trees.majority_rule_consensus()
     elif strategy_token == "prune" and method_token in ["scaled_transfer", "unscaled_transfer"]:
         if args.starting_tree is None:
@@ -378,7 +383,6 @@ def main(args=None):
             starting_tree = Tree_with_support.get(
                 path=args.starting_tree,
                 schema="newick",
-                taxon_namespace=input_trees.taxon_namespace,
             )
         except Exception as e:
             raise ConsensusError(f"Error in reading starting tree: {e}")
@@ -395,7 +399,7 @@ def main(args=None):
         consensus_tree = Tree_with_support.get(
             data=gre_nwk,
             schema="newick",
-            taxon_namespace=input_trees.taxon_namespace,
+            taxon_namespace=starting_tree.taxon_namespace,
         )
     elif method_token == "quartet":
         if args.starting_tree is None:
@@ -404,12 +408,18 @@ def main(args=None):
             starting_tree = Tree_with_support.get(
                 path=args.starting_tree,
                 schema="newick",
-                taxon_namespace=input_trees.taxon_namespace,
             )
         except Exception as e:
             raise ConsensusError(f"Error in reading starting tree: {e}")
-        consensus_tree = starting_tree.SQD_greedy_pruning(input_trees)
+        try:
+            consensus_tree = starting_tree.SQD_greedy_pruning_file(args.input_trees)
+        except Exception as e:
+            raise ConsensusError(f"Error in quartet pruning: {e}") from e
     else:
+        try:
+            input_trees = TreeList_with_support.get(path=args.input_trees, schema="newick")
+        except Exception as e:
+            raise ConsensusError(f"Error in reading input trees (Newick expected): {e}")
         if args.starting_tree is None:
             starting_tree = input_trees.majority_rule_consensus()
         else:
@@ -434,7 +444,17 @@ def main(args=None):
         if not isinstance(consensus_tree, Tree_with_support):
             consensus_tree = Tree_with_support(consensus_tree)
 
-    output_path, support_paths = _write_all_outputs(consensus_tree, input_trees, output_file)
+    prune_only = strategy_token == "prune" and method_token in {
+        "scaled_transfer",
+        "unscaled_transfer",
+        "quartet",
+    }
+    output_path, support_paths = _write_all_outputs(
+        consensus_tree,
+        output_file,
+        input_trees=input_trees,
+        input_trees_path=args.input_trees if prune_only else None,
+    )
     print(f"Output saved to: {output_path}")
     if support_paths:
         print("\nTree files with support values:")

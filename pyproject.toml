@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "PhyloCRISP"
-version = "0.0.2"
+version = "0.0.3"
 authors = [
   { name="Yuki Takazawa", email="yuki-takazawa@g.ecc.u-tokyo.ac.jp" },
 ]
@@ -34,9 +34,12 @@ dev = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["Consensus"]
+packages = ["phylocrisp"]
 license-files = ["LICENSE", "third_party_licenses/**"]
+
+[tool.setuptools.package-data]
+phylocrisp = ["bin/**/*", "example_data/**/*"]
 
 
 [project.scripts]
-phylocrisp-cli = "Consensus.main:main"
+phylocrisp-cli = "phylocrisp.main:main"

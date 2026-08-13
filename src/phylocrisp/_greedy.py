@@ -642,7 +642,7 @@ class SQDGreedyConsensus(GreedyConsensusBase):
             if method == "first":
                 self._first_greedy(sorted_index, exec_dir = exec_dir)
             if method == "most":
-                NotImplementedError("Method 'most' is not implemented for SQDGreedyConsensus.")
+                NotImplementedError("Method 'most' is not implemented for SQDGreedyphylocrisp.")
                
 
 class SUTDGreedyConsensus(GreedyConsensusBase):
